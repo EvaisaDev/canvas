@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Infinite Shared Pixel Art Canvas</title>
+    <!-- Font Awesome CDN Link -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
+    <!-- Link to the external CSS file -->
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Discord Login Status -->
+    <div id="login-status">
+        <span id="user-info"></span>
+        <a id="login-button" href="/auth/discord" class="auth-button">
+            <i class="fab fa-discord"></i> Login with Discord
+        </a>
+        <a id="logout-button" href="/logout" class="auth-button" style="display: none;">
+            <i class="fas fa-sign-out-alt"></i> Logout
+        </a>
+    </div>
+
+    <div id="container">
+        <!-- Canvas Map Container -->
+        <div id="canvas-map">
+        </div>
+
+        <!-- Color Palette -->
+        <div id="color-palette">
+            <div class="color-palette-column">
+                <!-- White and Pastel Colors -->
+                <div class="color-swatch" data-color="#FFFFFF" style="background-color: #FFFFFF;"></div>
+                <div class="color-swatch" data-color="#FFB3BA" style="background-color: #FFB3BA;"></div>
+                <div class="color-swatch" data-color="#FFDFBA" style="background-color: #FFDFBA;"></div>
+                <div class="color-swatch" data-color="#FFFFBA" style="background-color: #FFFFBA;"></div>
+                <div class="color-swatch" data-color="#BAFFC9" style="background-color: #BAFFC9;"></div>
+                <div class="color-swatch" data-color="#BAE1FF" style="background-color: #BAE1FF;"></div>
+                <div class="color-swatch" data-color="#C7CEEA" style="background-color: #C7CEEA;"></div>
+                <div class="color-swatch" data-color="#F3C1C6" style="background-color: #F3C1C6;"></div>
+                <div class="color-swatch" data-color="#F5F5DC" style="background-color: #F5F5DC;"></div>
+                <div class="color-swatch" data-color="#E2F0CB" style="background-color: #E2F0CB;"></div>
+            </div>
+            <div class="color-palette-column">
+                <!-- Black and Darker Colors -->
+                <div class="color-swatch" data-color="#000000" style="background-color: #000000;"></div>
+                <div class="color-swatch" data-color="#E74C3C" style="background-color: #E74C3C;"></div>
+                <div class="color-swatch" data-color="#E67E22" style="background-color: #E67E22;"></div>
+                <div class="color-swatch" data-color="#F1C40F" style="background-color: #F1C40F;"></div>
+                <div class="color-swatch" data-color="#27AE60" style="background-color: #27AE60;"></div>
+                <div class="color-swatch" data-color="#2980B9" style="background-color: #2980B9;"></div>
+                <div class="color-swatch" data-color="#8E44AD" style="background-color: #8E44AD;"></div>
+                <div class="color-swatch" data-color="#D2527F" style="background-color: #D2527F;"></div>
+                <div class="color-swatch" data-color="#7E5109" style="background-color: #7E5109;"></div>
+                <div class="color-swatch" data-color="#1ABC9C" style="background-color: #1ABC9C;"></div>
+            </div>
+        </div>
+
+        <!-- Tool Buttons -->
+        <div id="tool-buttons">
+            <button id="pencil-tool" class="tool-button selected" title="Pencil">
+                <i class="fas fa-pencil-alt"></i>
+            </button>
+            <button id="eraser-tool" class="tool-button" title="Eraser">
+                <i class="fas fa-eraser"></i>
+            </button>
+            <button id="fill-tool" class="tool-button" title="Fill">
+                <i class="fas fa-fill-drip"></i>
+            </button>
+            <button id="color-picker-tool" class="tool-button" title="Color Picker">
+                <i class="fas fa-eye-dropper"></i>
+            </button>
+        </div>
+
+        <!-- Pencil Size Slider -->
+        <div id="pencil-size-container">
+            <input type="range" id="pencil-size-slider" min="1" max="20" value="1">
+            <span id="pencil-size-display">1</span>
+        </div>
+    </div>
+
+    <!-- Tooltip for Pixel Info -->
+    <div id="pixel-tooltip" style="display: none;"></div>
+
+    <!-- Loading Indicator -->
+    <div id="loading-indicator" style="display: none;">
+        <i class="fas fa-spinner fa-spin"></i> Loading Canvas...
+    </div>
+
+    <!-- Include Socket.IO -->
+    <script src="/socket.io/socket.io.js"></script>
+    <!-- Include script.js -->
+    <script src="script.js"></script>
+</body>
+</html>
