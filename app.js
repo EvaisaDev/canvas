@@ -171,13 +171,14 @@ io.on('connection', (socket) => {
 
         for (let dx = -radius; dx <= radius; dx++) {
             for (let dy = -radius; dy <= radius; dy++) {
-                if (size >= 3) {
-                    if (dx * dx + dy * dy <= radius * radius) {
-                        const pixelX = x + dx;
-                        const pixelY = y + dy;
-                        const key = `${pixelX},${pixelY}`;
-                        canvasData[key] = { color: color, user, timestamp };
-                    }
+				if (size >= 3) {
+					// Use a slightly tighter condition to avoid pixel extrusions
+					if (dx * dx + dy * dy <= radius * radius - radius * 0.2) {
+						const pixelX = x + dx;
+						const pixelY = y + dy;
+						const key = `${pixelX},${pixelY}`;
+						canvasData[key] = { color: color, user, timestamp };
+					}
                 } else if (size === 2) {
                     if (dx === 0 || dy === 0) {
                         const pixelX = x + dx;

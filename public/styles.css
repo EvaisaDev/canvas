@@ -69,7 +69,6 @@ body {
     gap: 10px;
     justify-content: center;
     align-items: center;
-    transition: transform 0.3s ease;
     transform-origin: top left;
     overflow: visible;
 }
