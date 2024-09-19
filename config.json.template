@@ -1,6 +1,6 @@
 {
-	"discord_client_id": "1285957798286332078",
-	"discord_client_secret": "7TStEMXL6CRAnfh85EuuNmgwQ3J3gUL9",
+	"discord_client_id": "",
+	"discord_client_secret": "",
 	"callback_url": "http://localhost:3000/auth/discord/callback",
 
 	"session_secret": ":3 mrrrrp mrreow mrow mrrrp mrow meow meeeeow"
