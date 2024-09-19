@@ -2,6 +2,6 @@
 	"discord_client_id": "",
 	"discord_client_secret": "",
 	"callback_url": "http://localhost:3000/auth/discord/callback",
-
+	"port": 7274,
 	"session_secret": ":3 mrrrrp mrreow mrow mrrrp mrow meow meeeeow"
 }

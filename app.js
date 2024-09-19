@@ -21,7 +21,7 @@ const canvasEnmap = new Enmap({ name: 'canvases' });
 
 // Session middleware
 const sessionMiddleware = session({
-    secret: 'your-session-secret', // Replace with your session secret (use a strong, unique value)
+    secret: config.session_secret, // Replace with your session secret (use a strong, unique value)
     resave: false,
     saveUninitialized: false
 });
@@ -284,7 +284,7 @@ io.on('connection', (socket) => {
     });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || config.port;
 http.listen(PORT, () => {
     console.log(`Server is running on port ${PORT}`);
 });
