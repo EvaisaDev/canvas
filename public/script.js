@@ -10,7 +10,7 @@ const loadingIndicator = document.getElementById('loading-indicator');
 // Tool Setup
 let currentTool = 'pencil';
 let currentColor = '#FFB3BA'; // Default color
-let pencilSize = 1;
+let pencilSize = 6;
 
 // Authentication state
 let isAuthenticated = false;
@@ -19,19 +19,20 @@ let userInfo = null;
 // Map to track existing canvases and their contexts
 const canvases = new Map(); // key: 'x|y', value: { canvas, ctx, drawing }
 
-// Tooltip timeout
-let hoverTimeout = null;
-
 // Panning and Zooming variables
 let isPanning = false;
 let startPan = { x: 0, y: 0 };
 let currentPan = { x: 0, y: 0 };
 let currentZoom = 1;
-const minZoom = 0.5;
-const maxZoom = 3;
+const minZoom = 0.2;
+const maxZoom = 20;
 
 // Tooltip Element
 const tooltip = document.getElementById('pixel-tooltip');
+
+// Track drawing state globally
+let isDrawing = false;
+let currentCanvasObj = null;
 
 // Classes for Tools
 
@@ -55,82 +56,63 @@ class PencilTool extends Tool {
 
     onMouseDown(e, canvasObj) {
         if (!isAuthenticated) {
-            alert('You must be logged in with Discord to draw on the canvas.');
             return;
         }
-        canvasObj.drawing = true;
+        isDrawing = true;
+        currentCanvasObj = canvasObj;
         const { x, y } = getCanvasCoordinates(e, canvasObj);
         this.lastPosition = { x, y }; // Store the start position
         this.plotPoint(canvasObj, x, y, currentColor); // Plot the initial point on mouse down
     }
 
     onMouseMove(e, canvasObj) {
-        if (canvasObj.drawing) {
-            this.draw(e, canvasObj);
+        if (isDrawing && currentCanvasObj) {
+            this.draw(e, currentCanvasObj);
         }
     }
 
     onMouseUp(e, canvasObj) {
-        if (canvasObj.drawing) {
-            canvasObj.drawing = false;
-            this.lastPosition = null; // Reset last position when drawing ends
-        }
+        isDrawing = false;
+        currentCanvasObj = null;
+        this.lastPosition = null; // Reset last position when drawing ends
     }
 
     draw(e, canvasObj) {
         const { x, y } = getCanvasCoordinates(e, canvasObj);
         const drawColor = currentTool === 'eraser' ? '#FFFFFF' : currentColor;
 
-        // If lastPosition is defined, interpolate between the points
         if (this.lastPosition && (this.lastPosition.x !== x || this.lastPosition.y !== y)) {
             this.interpolateLine(canvasObj, this.lastPosition.x, this.lastPosition.y, x, y, drawColor);
         }
 
-        // Update last position
         this.lastPosition = { x, y };
     }
 
     plotPoint(canvasObj, x, y, drawColor) {
-        // Check if the point is within the current canvas boundaries
         if (x < 0 || x >= canvasObj.canvas.width || y < 0 || y >= canvasObj.canvas.height) {
-            // Determine the direction of the overflow
-            let direction = null;
             let adjCanvasObj = null;
             let adjX = x;
             let adjY = y;
 
+            // Determine direction and correct edge crossing logic
             if (x < 0) {
-                direction = 'left';
                 adjX = canvasObj.canvas.width - 1;
-                adjY = y;
             } else if (x >= canvasObj.canvas.width) {
-                direction = 'right';
                 adjX = 0;
-                adjY = y;
             } else if (y < 0) {
-                direction = 'down'; // Assuming Y increases upwards
-                adjX = x;
                 adjY = canvasObj.canvas.height - 1;
             } else if (y >= canvasObj.canvas.height) {
-                direction = 'up';
-                adjX = x;
                 adjY = 0;
             }
 
-            if (direction) {
-                // Get the ID of the neighboring canvas
-                const neighborId = getNeighborCanvasId(canvasObj.id, direction);
+            const direction = this.getDirectionFromEdge(x, y, canvasObj);
+            const neighborId = getNeighborCanvasId(canvasObj.id, direction);
 
-                // Get the neighboring canvas object
-                adjCanvasObj = canvases.get(neighborId);
-
-                if (adjCanvasObj) {
-                    // Continue drawing on the adjacent canvas
-                    this.plotPoint(adjCanvasObj, adjX, adjY, drawColor);
-                    this.lastPosition = { x: adjX, y: adjY }; // Update last position
-                } else {
-                    alert(`No canvas exists to the ${direction}. Please create it first.`);
-                }
+            adjCanvasObj = canvases.get(neighborId);
+            if (adjCanvasObj) {
+                this.plotPoint(adjCanvasObj, adjX, adjY, drawColor);
+                this.lastPosition = { x: adjX, y: adjY };
+                currentCanvasObj = adjCanvasObj;
             }
             return;
         }
@@ -140,32 +122,70 @@ class PencilTool extends Tool {
         canvasObj.ctx.imageSmoothingEnabled = false;
 
         if (pencilSize >= 3) {
-            drawCircle(canvasObj.ctx, x, y, pencilSize / 2);
+            drawCircle(canvasObj.ctx, x, y, pencilSize / 2, { color: drawColor, user: userInfo, timestamp: Date.now() }, canvasObj.id);
         } else if (pencilSize === 2) {
-            drawPlusShape(canvasObj.ctx, x, y);
+            drawPlusShape(canvasObj.ctx, x, y, { color: drawColor, user: userInfo, timestamp: Date.now() }, canvasObj.id);
         } else {
             canvasObj.ctx.fillRect(x, y, 1, 1);
         }
 
-        // Emit draw event to the server
+		// update local pixel data
+		if (!canvasObj.canvasData) {
+			canvasObj.canvasData = {};
+		}
+		canvasObj.canvasData[`${x},${y}`] = { color: drawColor, user: userInfo, timestamp: Date.now() };
+
         socket.emit('draw-pixel', { canvasId: canvasObj.id, x, y, color: drawColor, size: pencilSize, tool: currentTool });
     }
 
-    // Function to interpolate between two points and draw
     interpolateLine(canvasObj, x1, y1, x2, y2, drawColor) {
         const distance = Math.hypot(x2 - x1, y2 - y1);
-        const steps = Math.ceil(distance); // Number of steps to draw in between
+        const steps = Math.ceil(distance);
 
         for (let i = 0; i <= steps; i++) {
             const t = i / steps;
             let interpolatedX = Math.round(x1 + t * (x2 - x1));
             let interpolatedY = Math.round(y1 + t * (y2 - y1));
 
-            // Handle drawing across canvases
+            // Stop interpolation at the edges and handle edge crossing
+            if (interpolatedX < 0 || interpolatedX >= canvasObj.canvas.width || interpolatedY < 0 || interpolatedY >= canvasObj.canvas.height) {
+                this.handleEdgeCrossing(interpolatedX, interpolatedY, canvasObj, drawColor);
+                break;  // Stop interpolation and handle crossing to the next canvas
+            }
+
             this.plotPoint(canvasObj, interpolatedX, interpolatedY, drawColor);
         }
     }
+
+    handleEdgeCrossing(x, y, canvasObj, drawColor) {
+        let adjX = x;
+        let adjY = y;
+
+        if (x < 0) adjX = canvasObj.canvas.width - 1;
+        else if (x >= canvasObj.canvas.width) adjX = 0;
+
+        if (y < 0) adjY = canvasObj.canvas.height - 1;
+        else if (y >= canvasObj.canvas.height) adjY = 0;
+
+        const direction = this.getDirectionFromEdge(x, y, canvasObj);
+        const neighborId = getNeighborCanvasId(canvasObj.id, direction);
+        const adjCanvasObj = canvases.get(neighborId);
+
+        if (adjCanvasObj) {
+            this.plotPoint(adjCanvasObj, adjX, adjY, drawColor);
+            currentCanvasObj = adjCanvasObj;  // Update current canvas after crossing
+            this.lastPosition = { x: adjX, y: adjY };
+        }
+    }
+
+    getDirectionFromEdge(x, y, canvasObj) {
+        if (x < 0) return 'left';
+        if (x >= canvasObj.canvas.width) return 'right';
+        if (y < 0) return 'down';
+        if (y >= canvasObj.canvas.height) return 'up';
+    }
 }
+
 
 // Eraser Tool
 class EraserTool extends Tool {
@@ -176,144 +196,145 @@ class EraserTool extends Tool {
 
     onMouseDown(e, canvasObj) {
         if (!isAuthenticated) {
-            alert('You must be logged in with Discord to use the eraser.');
             return;
         }
-        canvasObj.drawing = true;
+        isDrawing = true;
+        currentCanvasObj = canvasObj;
         const { x, y } = getCanvasCoordinates(e, canvasObj);
         this.lastPosition = { x, y }; // Store the start position
         this.plotPoint(canvasObj, x, y, '#FFFFFF'); // Erase the initial point on mouse down
     }
 
     onMouseMove(e, canvasObj) {
-        if (canvasObj.drawing) {
-            this.erase(e, canvasObj);
+        if (isDrawing && currentCanvasObj) {
+            this.erase(e, currentCanvasObj);
         }
     }
 
     onMouseUp(e, canvasObj) {
-        if (canvasObj.drawing) {
-            canvasObj.drawing = false;
-            this.lastPosition = null; // Reset last position when erasing ends
-        }
+        isDrawing = false;
+        currentCanvasObj = null;
+        this.lastPosition = null; // Reset last position when erasing ends
     }
 
     erase(e, canvasObj) {
         const { x, y } = getCanvasCoordinates(e, canvasObj);
         const eraseColor = '#FFFFFF';
 
-        // If lastPosition is defined, interpolate between the points
         if (this.lastPosition && (this.lastPosition.x !== x || this.lastPosition.y !== y)) {
             this.interpolateLine(canvasObj, this.lastPosition.x, this.lastPosition.y, x, y, eraseColor);
         }
 
-        // Update last position
         this.lastPosition = { x, y };
     }
 
-    plotPoint(canvasObj, x, y, eraseColor) {
-        // Check if the point is within the current canvas boundaries
+    plotPoint(canvasObj, x, y, drawColor) {
         if (x < 0 || x >= canvasObj.canvas.width || y < 0 || y >= canvasObj.canvas.height) {
-            // Determine the direction of the overflow
-            let direction = null;
             let adjCanvasObj = null;
             let adjX = x;
             let adjY = y;
 
+            // Determine direction and correct edge crossing logic
             if (x < 0) {
-                direction = 'left';
                 adjX = canvasObj.canvas.width - 1;
-                adjY = y;
             } else if (x >= canvasObj.canvas.width) {
-                direction = 'right';
                 adjX = 0;
-                adjY = y;
             } else if (y < 0) {
-                direction = 'down'; // Assuming Y increases upwards
-                adjX = x;
                 adjY = canvasObj.canvas.height - 1;
             } else if (y >= canvasObj.canvas.height) {
-                direction = 'up';
-                adjX = x;
                 adjY = 0;
             }
 
-            if (direction) {
-                // Get the ID of the neighboring canvas
-                const neighborId = getNeighborCanvasId(canvasObj.id, direction);
+            const direction = this.getDirectionFromEdge(x, y, canvasObj);
+            const neighborId = getNeighborCanvasId(canvasObj.id, direction);
 
-                // Get the neighboring canvas object
-                adjCanvasObj = canvases.get(neighborId);
-
-                if (adjCanvasObj) {
-                    // Continue erasing on the adjacent canvas
-                    this.plotPoint(adjCanvasObj, adjX, adjY, eraseColor);
-                    this.lastPosition = { x: adjX, y: adjY }; // Update last position
-                } else {
-                    alert(`No canvas exists to the ${direction}. Please create it first.`);
-                }
+            adjCanvasObj = canvases.get(neighborId);
+            if (adjCanvasObj) {
+                this.plotPoint(adjCanvasObj, adjX, adjY, drawColor);
+                this.lastPosition = { x: adjX, y: adjY };
+                currentCanvasObj = adjCanvasObj;
             }
             return;
         }
 
-        // Erase normally within the current canvas
-        canvasObj.ctx.fillStyle = eraseColor;
+        // Plot normally within the current canvas
+        canvasObj.ctx.fillStyle = drawColor;
         canvasObj.ctx.imageSmoothingEnabled = false;
 
         if (pencilSize >= 3) {
-            drawCircle(canvasObj.ctx, x, y, pencilSize / 2);
+            drawCircle(canvasObj.ctx, x, y, pencilSize / 2, { color: drawColor, user: userInfo, timestamp: Date.now() }, canvasObj.id);
         } else if (pencilSize === 2) {
-            drawPlusShape(canvasObj.ctx, x, y);
+            drawPlusShape(canvasObj.ctx, x, y, { color: drawColor, user: userInfo, timestamp: Date.now() }, canvasObj.id);
         } else {
             canvasObj.ctx.fillRect(x, y, 1, 1);
         }
 
-        // Emit draw event to the server
-        socket.emit('draw-pixel', { canvasId: canvasObj.id, x, y, color: eraseColor, size: pencilSize, tool: currentTool });
+		if (!canvasObj.canvasData) {
+			canvasObj.canvasData = {};
+		}
+		canvasObj.canvasData[`${x},${y}`] = { color: drawColor, user: userInfo, timestamp: Date.now() };
+
+        socket.emit('draw-pixel', { canvasId: canvasObj.id, x, y, color: drawColor, size: pencilSize, tool: currentTool });
     }
 
-    // Function to interpolate between two points and erase
-    interpolateLine(canvasObj, x1, y1, x2, y2, eraseColor) {
+    interpolateLine(canvasObj, x1, y1, x2, y2, drawColor) {
         const distance = Math.hypot(x2 - x1, y2 - y1);
-        const steps = Math.ceil(distance); // Number of steps to draw in between
+        const steps = Math.ceil(distance);
 
         for (let i = 0; i <= steps; i++) {
             const t = i / steps;
             let interpolatedX = Math.round(x1 + t * (x2 - x1));
             let interpolatedY = Math.round(y1 + t * (y2 - y1));
 
-            // Handle erasing across canvases
-            this.plotPoint(canvasObj, interpolatedX, interpolatedY, eraseColor);
+            // Stop interpolation at the edges and handle edge crossing
+            if (interpolatedX < 0 || interpolatedX >= canvasObj.canvas.width || interpolatedY < 0 || interpolatedY >= canvasObj.canvas.height) {
+                this.handleEdgeCrossing(interpolatedX, interpolatedY, canvasObj, drawColor);
+                break;  // Stop interpolation and handle crossing to the next canvas
+            }
+
+            this.plotPoint(canvasObj, interpolatedX, interpolatedY, drawColor);
         }
+    }
+
+    handleEdgeCrossing(x, y, canvasObj, drawColor) {
+        let adjX = x;
+        let adjY = y;
+
+        if (x < 0) adjX = canvasObj.canvas.width - 1;
+        else if (x >= canvasObj.canvas.width) adjX = 0;
+
+        if (y < 0) adjY = canvasObj.canvas.height - 1;
+        else if (y >= canvasObj.canvas.height) adjY = 0;
+
+        const direction = this.getDirectionFromEdge(x, y, canvasObj);
+        const neighborId = getNeighborCanvasId(canvasObj.id, direction);
+        const adjCanvasObj = canvases.get(neighborId);
+
+        if (adjCanvasObj) {
+            this.plotPoint(adjCanvasObj, adjX, adjY, drawColor);
+            currentCanvasObj = adjCanvasObj;  // Update current canvas after crossing
+            this.lastPosition = { x: adjX, y: adjY };
+        }
+    }
+
+    getDirectionFromEdge(x, y, canvasObj) {
+        if (x < 0) return 'left';
+        if (x >= canvasObj.canvas.width) return 'right';
+        if (y < 0) return 'down';
+        if (y >= canvasObj.canvas.height) return 'up';
     }
 }
 
-// Fill Tool
-class FillTool extends Tool {
-    constructor(name) {
-        super(name);
-    }
+const color = currentColor;
+currentColor = color;
 
-    onMouseDown(e, canvasObj) {
-        if (!isAuthenticated) {
-            alert('You must be logged in with Discord to use the fill tool.');
-            return;
-        }
-        this.fill(e, canvasObj);
-    }
-
-    onMouseMove(e, canvasObj) {}
-    onMouseUp(e, canvasObj) {}
-
-    fill(e, canvasObj) {
-        const { x, y } = getCanvasCoordinates(e, canvasObj);
-        const targetColor = getPixelColor(canvasObj.id, x, y);
-        if (targetColor.toLowerCase() === currentColor.toLowerCase()) return; // Avoid unnecessary fill
-
-        // Emit fill event to the server
-        socket.emit('fill', { canvasId: canvasObj.id, x, y, targetColor, newColor: currentColor });
-    }
-}
+const swatches = document.querySelectorAll('.color-swatch');
+swatches.forEach(swatch => {
+	swatch.classList.remove('selected');
+	if (swatch.getAttribute('data-color').toLowerCase() === color.toLowerCase()) {
+		swatch.classList.add('selected');
+	}
+});
 
 // Color Picker Tool
 class ColorPickerTool extends Tool {
@@ -333,7 +354,6 @@ class ColorPickerTool extends Tool {
         const color = getPixelColor(canvasObj.id, x, y);
         currentColor = color;
 
-        // Update selected color swatch
         const swatches = document.querySelectorAll('.color-swatch');
         swatches.forEach(swatch => {
             swatch.classList.remove('selected');
@@ -348,13 +368,80 @@ class ColorPickerTool extends Tool {
 const tools = {
     'pencil': new PencilTool('pencil'),
     'eraser': new EraserTool('eraser'),
-    'fill': new FillTool('fill'),
     'color-picker': new ColorPickerTool('color-picker')
 };
 
 // Set default tool
 currentTool = 'pencil';
 document.getElementById('pencil-tool').classList.add('selected');
+
+// Global Mouse Event Listeners for Drawing Across Canvases
+// Global Mouse Event Listeners for Drawing Across Canvases
+document.addEventListener('mousedown', (e) => {
+    if (disableDrawing || e.button !== 0) return;  // Only draw with left click (button 0)
+    handleMouseDown(e);
+});
+
+document.addEventListener('mousemove', (e) => {
+    if (!isDrawing) return;  // Only draw if drawing state is active
+    handleMouseMove(e);
+});
+
+document.addEventListener('mouseup', (e) => {
+    if (!isDrawing) return;
+    handleMouseUp(e);
+    isDrawing = false;
+    currentCanvasObj = null;
+});
+
+// Handle `mouseenter` to simulate drawing when dragging across canvases
+document.addEventListener('mouseenter', (e) => {
+    if (e.buttons === 1) {  // If the left mouse button is being held down
+        handleMouseDown(e);  // Simulate `mousedown` when dragging into a new canvas
+    }
+}, true);
+
+// Function to handle mouse down
+function handleMouseDown(e) {
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper) return;
+
+    const canvasId = targetCanvasWrapper.getAttribute('data-x') + '|' + targetCanvasWrapper.getAttribute('data-y');
+    const canvasObj = canvases.get(canvasId);
+
+    if (canvasObj) {
+        const tool = tools[currentTool];
+        if (tool && tool.onMouseDown) {
+            tool.onMouseDown(e, canvasObj);
+        }
+    }
+}
+
+// Function to handle mouse move
+function handleMouseMove(e) {
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper || !currentCanvasObj) return;
+
+    const canvasId = targetCanvasWrapper.getAttribute('data-x') + '|' + targetCanvasWrapper.getAttribute('data-y');
+    const canvasObj = canvases.get(canvasId);
+
+    if (canvasObj && tools[currentTool].onMouseMove) {
+        tools[currentTool].onMouseMove(e, canvasObj);
+    }
+}
+
+// Function to handle mouse up
+function handleMouseUp(e) {
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper || !currentCanvasObj) return;
+
+    const canvasId = targetCanvasWrapper.getAttribute('data-x') + '|' + targetCanvasWrapper.getAttribute('data-y');
+    const canvasObj = canvases.get(canvasId);
+
+    if (canvasObj && tools[currentTool].onMouseUp) {
+        tools[currentTool].onMouseUp(e, canvasObj);
+    }
+}
 
 // Authentication and User Info Handling
 
@@ -398,7 +485,6 @@ function fetchAuthStatus() {
 window.onload = () => {
     fetchAuthStatus();
 
-    // Initialize the first canvas (0,0)
     socket.emit('request-canvas-list');
 
     socket.on('update-canvas-list', (data) => {
@@ -408,24 +494,19 @@ window.onload = () => {
             createCanvasWrapper(x, y);
         });
 
-        // if not canvas at 0,0, create it
         if (!canvasList.includes('0|0')) {
             createCanvasWrapper(0, 0);
         }
     });
 
-    // Initialize event listeners for panning and zooming
     initPanAndZoom();
 };
 
 // Event Listeners for Tool Selection
 document.querySelectorAll('.tool-button').forEach(button => {
     button.addEventListener('click', () => {
-        // Remove 'selected' class from all tools
         document.querySelectorAll('.tool-button').forEach(btn => btn.classList.remove('selected'));
-        // Add 'selected' class to the clicked tool
         button.classList.add('selected');
-        // Set current tool
         currentTool = button.id.replace('-tool', '');
     });
 });
@@ -454,25 +535,21 @@ function createCanvasWrapper(x, y) {
     const canvasId = `${x}|${y}`;
 
     if (canvases.has(canvasId)) {
-        // Canvas already exists
         return;
     }
 
-    // Create canvas wrapper
     const wrapper = document.createElement('div');
     wrapper.classList.add('canvas-wrapper');
     wrapper.setAttribute('data-x', x);
     wrapper.setAttribute('data-y', y);
-    positionCanvas(wrapper, x, y); // Position the canvas
+    positionCanvas(wrapper, x, y);
 
-    // Create canvas
     const canvas = document.createElement('canvas');
     canvas.classList.add('canvas');
     canvas.width = 512;
     canvas.height = 512;
     wrapper.appendChild(canvas);
 
-    // Create directional arrows
     const directions = ['up', 'down', 'left', 'right'];
     directions.forEach(direction => {
         const arrow = document.createElement('button');
@@ -485,14 +562,11 @@ function createCanvasWrapper(x, y) {
         wrapper.appendChild(arrow);
     });
 
-    // Append to canvas map
     canvasMap.appendChild(wrapper);
 
-    // Get context
     const ctx = canvas.getContext('2d');
     ctx.imageSmoothingEnabled = false;
 
-    // Initialize canvas object
     const canvasObj = {
         id: canvasId,
         x: x,
@@ -505,33 +579,8 @@ function createCanvasWrapper(x, y) {
 
     canvases.set(canvasId, canvasObj);
 
-    // Connect to Socket.IO room
     socket.emit('join-canvas', { canvasId });
 
-    // Listen for drawing events globally
-    socket.on('draw-pixel', (data) => {
-        if (data.canvasId !== canvasId) return;
-        const { x: drawX, y: drawY, color, size, tool } = data;
-        ctx.fillStyle = color;
-        ctx.imageSmoothingEnabled = false;
-
-        if (size >= 3) {
-            drawCircle(ctx, drawX, drawY, size / 2);
-        } else if (size === 2) {
-            drawPlusShape(ctx, drawX, drawY);
-        } else {
-            ctx.fillRect(drawX, drawY, 1, 1);
-        }
-    });
-
-    // Listen for fill events globally
-    socket.on('fill', (data) => {
-        if (data.canvasId !== canvasId) return;
-        const { x: fillX, y: fillY, targetColor, newColor } = data;
-        floodFill(fillX, fillY, targetColor, newColor, canvasId);
-    });
-
-    // Listen for initial canvas data
     socket.on('init-canvas', (data) => {
         if (data.canvasId === canvasId) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -543,21 +592,23 @@ function createCanvasWrapper(x, y) {
                 ctx.fillStyle = canvasData[key].color;
                 ctx.fillRect(px, py, 1, 1);
             }
-            // Hide loading indicator if active
+			canvasObj.canvasData = canvasData;
             loadingIndicator.style.display = 'none';
-            // Update arrows based on existing canvases
             updateArrowsVisibility(x, y);
         }
     });
 
-    // Add mouse event listeners for drawing
     addCanvasEventListeners(canvas, canvasObj);
 }
 
-// Handle directional arrow clicks to create new canvases
 function handleArrowClick(currentX, currentY, direction) {
     let newX = currentX;
     let newY = currentY;
+
+	// if not authenticated, do not allow creating new canvases
+	if (!isAuthenticated) {
+		return
+	}
 
     switch(direction) {
         case 'up':
@@ -582,14 +633,9 @@ function handleArrowClick(currentX, currentY, direction) {
         return;
     }
 
-    // Show loading indicator
     loadingIndicator.style.display = 'flex';
-
-    // Create the new canvas
     createCanvasWrapper(newX, newY);
 }
-
-// Utility Functions
 
 // Capitalize first letter
 function capitalize(string) {
@@ -608,55 +654,45 @@ function getCanvasCoordinates(e, canvasObj) {
 }
 
 // Draw a pixelated circle
-function drawCircle(ctx, x, y, radius) {
+function drawCircle(ctx, x, y, radius, pixelinfo, canvasId) {
+	const canvasObj = canvases.get(canvasId);
+	if (!canvasObj) return;
     radius = Math.floor(radius);
     for (let dx = -radius; dx <= radius; dx++) {
         for (let dy = -radius; dy <= radius; dy++) {
-            // Use a slightly tighter condition to avoid pixel extrusions
             if ((dx * dx + dy * dy) <= (radius * radius - radius * 0.2)) {
                 ctx.fillRect(x + dx, y + dy, 1, 1);
+				const key = `${x + dx},${y + dy}`;
+				canvasObj.canvasData[key] = pixelinfo;
             }
         }
     }
 }
 
 // Draw a plus shape for size 2
-function drawPlusShape(ctx, x, y) {
+function drawPlusShape(ctx, x, y, pixelinfo, canvasId) {
     ctx.fillRect(x, y - 1, 1, 3); // Vertical line
     ctx.fillRect(x - 1, y, 3, 1); // Horizontal line
-}
 
-// Flood fill algorithm (client-side for visualization)
-function floodFill(x, y, targetColor, newColor, canvasId) {
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return;
-
-    const stack = [];
-    stack.push({ x: x, y: y });
-
-    while (stack.length > 0) {
-        const { x, y } = stack.pop();
-        const key = `${x},${y}`;
-
-        // Get current color at (x, y)
-        const currentPixelColor = getPixelColor(canvasId, x, y);
-        if (currentPixelColor.toLowerCase() !== targetColor.toLowerCase()) continue;
-        if (currentPixelColor.toLowerCase() === newColor.toLowerCase()) continue;
-
-        canvasObj.ctx.fillStyle = newColor;
-        canvasObj.ctx.fillRect(x, y, 1, 1);
-
-        stack.push({ x: x + 1, y: y });
-        stack.push({ x: x - 1, y: y });
-        stack.push({ x: x, y: y + 1 });
-        stack.push({ x: x, y: y - 1 });
-    }
+	// add pixel data for each pixel in the plus shape
+	const canvasObj = canvases.get(canvasId);
+	if (!canvasObj) return;
+	const key1 = `${x},${y - 1}`;
+	const key2 = `${x},${y}`;
+	const key3 = `${x - 1},${y}`;
+	const key4 = `${x + 1},${y}`;
+	const key5 = `${x},${y + 1}`;
+	canvasObj.canvasData[key1] = pixelinfo;
+	canvasObj.canvasData[key2] = pixelinfo;
+	canvasObj.canvasData[key3] = pixelinfo;
+	canvasObj.canvasData[key4] = pixelinfo;
+	canvasObj.canvasData[key5] = pixelinfo;
 }
 
 // Get pixel color from canvas
 function getPixelColor(canvasId, x, y) {
     const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return '#FFFFFF'; // Default color
+    if (!canvasObj) return '#FFFFFF';
 
     try {
         const pixelData = canvasObj.ctx.getImageData(x, y, 1, 1).data;
@@ -668,11 +704,16 @@ function getPixelColor(canvasId, x, y) {
     }
 }
 
-// Tooltip Handling
+// Variable to store the timeout ID for hover delay
+let hoverTimeout = null;
+let lastHoveredPixel = null; // To track if the mouse is still over the same pixel
+
 canvasMap.addEventListener('mousemove', (e) => {
     const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
     if (!targetCanvasWrapper) {
         hidePixelInfo();
+        clearTimeout(hoverTimeout); // Clear the timeout if the mouse leaves
+        lastHoveredPixel = null; // Reset hovered pixel
         return;
     }
 
@@ -680,14 +721,37 @@ canvasMap.addEventListener('mousemove', (e) => {
     const canvasObj = canvases.get(canvasId);
     if (!canvasObj) {
         hidePixelInfo();
+        clearTimeout(hoverTimeout); // Clear the timeout if the mouse leaves
+        lastHoveredPixel = null; // Reset hovered pixel
         return;
     }
 
     const { x, y } = getCanvasCoordinates(e, canvasObj);
     const key = `${x},${y}`;
+    
+    // Fetch the pixel data for the hovered pixel
+    const pixelData = canvasObj.canvasData ? canvasObj.canvasData[key] : null;
 
-    // Since client doesn't have authoritative canvasData, we can request server data or skip tooltip
-    // Implement tooltip as needed based on your data handling strategy
+    // Check if hovering over a new pixel or same pixel
+    const currentHoveredPixel = { canvasId, x, y };
+    if (lastHoveredPixel && lastHoveredPixel.canvasId === canvasId && lastHoveredPixel.x === x && lastHoveredPixel.y === y) {
+        // Still hovering over the same pixel, do nothing
+        return;
+    }
+
+    // Clear any previous timeout when moving to a new pixel
+    clearTimeout(hoverTimeout);
+    lastHoveredPixel = currentHoveredPixel; // Update the last hovered pixel
+
+    if (pixelData && pixelData.user) {
+        // Set a timeout to show the tooltip after 5 seconds
+        /*hoverTimeout = setTimeout(() => {
+            showPixelInfo(e, pixelData);
+        }, 200);*/
+		showPixelInfo(e, pixelData);
+    } else {
+        hidePixelInfo();
+    }
 });
 
 function showPixelInfo(e, info) {
@@ -701,25 +765,23 @@ function showPixelInfo(e, info) {
 }
 
 function hidePixelInfo() {
-    if (tooltip) {
-        tooltip.style.display = 'none';
-    }
+    tooltip.style.display = 'none';
+    clearTimeout(hoverTimeout); // Clear the timeout when hiding the tooltip
 }
 
-let disableDrawing = false; // A flag to prevent drawing during panning
+let disableDrawing = false;
 
 function initPanAndZoom() {
     let isMouseDown = false;
     let isSpacePressed = false;
     let lastMousePosition = { x: 0, y: 0 };
 
-    // Mouse Events for Panning with middle mouse button or space + left mouse
     document.addEventListener('mousedown', (e) => {
-        if (e.button === 1 || (e.button === 0 && isSpacePressed)) { // Middle mouse or Space + Left mouse
+        if (e.button === 1 || (e.button === 0 && isSpacePressed)) {
             e.preventDefault();
             isPanning = true;
             isMouseDown = true;
-            disableDrawing = true;  // Disable drawing when panning
+            disableDrawing = true;
             lastMousePosition = { x: e.clientX, y: e.clientY };
             canvasMap.classList.add('grabbing');
         }
@@ -729,7 +791,7 @@ function initPanAndZoom() {
         if (isPanning) {
             isPanning = false;
             isMouseDown = false;
-            disableDrawing = false;  // Re-enable drawing after panning
+            disableDrawing = false;
             canvasMap.classList.remove('grabbing');
         }
     });
@@ -737,53 +799,49 @@ function initPanAndZoom() {
     window.addEventListener('mousemove', (e) => {
         if (!isPanning) return;
 
-        // Calculate how much the mouse has moved
         const deltaX = e.clientX - lastMousePosition.x;
         const deltaY = e.clientY - lastMousePosition.y;
 
-        // Only update panning if there's actual movement
         if (deltaX !== 0 || deltaY !== 0) {
-            // Apply delta to current pan
             currentPan.x += deltaX;
             currentPan.y += deltaY;
 
-            // Update the lastMousePosition to the current position
             lastMousePosition = { x: e.clientX, y: e.clientY };
 
-            // Apply the panning
             updateCanvasMapTransform();
         }
     });
 
-    // Zooming with mouse wheel, applied to the entire document
-    document.addEventListener('wheel', (e) => {
-        e.preventDefault();
-        const rect = canvasMap.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
+	document.addEventListener('wheel', (e) => {
+		e.preventDefault();
+		const rect = canvasMap.getBoundingClientRect();
+		const mouseX = e.clientX - rect.left;
+		const mouseY = e.clientY - rect.top;
+	
+		const scaleFactor = 0.1; // Control zoom speed here
+		const wheel = e.deltaY < 0 ? 1 : -1;
+		
+		// Apply exponential scaling for smoother zoom
+		let newZoom = currentZoom * (1 + wheel * scaleFactor);
+	
+		// Keep zoom within bounds
+		newZoom = Math.min(Math.max(newZoom, minZoom), maxZoom);
+		const zoomChange = newZoom / currentZoom;
+	
+		// Adjust panning to keep the mouse position in the same place
+		currentPan.x -= mouseX * (zoomChange - 1);
+		currentPan.y -= mouseY * (zoomChange - 1);
+	
+		currentZoom = newZoom;
+		updateCanvasMapTransform();
+	});
+	
 
-        const wheel = e.deltaY < 0 ? 1 : -1;
-        const zoomFactor = 0.1;
-        let newZoom = currentZoom + wheel * zoomFactor;
-
-        // Constrain zoom level between minZoom and maxZoom
-        newZoom = Math.min(Math.max(newZoom, minZoom), maxZoom);
-        const zoomChange = newZoom / currentZoom;
-
-        // Adjust pan relative to the mouse position for zoom effect
-        currentPan.x -= mouseX * (zoomChange - 1);
-        currentPan.y -= mouseY * (zoomChange - 1);
-
-        currentZoom = newZoom;
-        updateCanvasMapTransform();
-    });
-
-    // Panning with spacebar
     document.addEventListener('keydown', (e) => {
         if (e.code === 'Space') {
             e.preventDefault();
             isSpacePressed = true;
-            disableDrawing = true;  // Disable drawing while holding space
+            disableDrawing = true;
             canvasMap.classList.add('grab');
         }
     });
@@ -791,7 +849,7 @@ function initPanAndZoom() {
     document.addEventListener('keyup', (e) => {
         if (e.code === 'Space') {
             isSpacePressed = false;
-            disableDrawing = false;  // Re-enable drawing after releasing space
+            disableDrawing = false;
             canvasMap.classList.remove('grab');
         }
     });
@@ -799,19 +857,18 @@ function initPanAndZoom() {
 
 function positionCanvas(wrapper, x, y) {
     const canvasSize = 512;
-    const gap = 10; // space between canvases
+    const gap = 10;
     wrapper.style.left = `${x * (canvasSize + gap)}px`;
-    wrapper.style.top = `${-y * (canvasSize + gap)}px`; // negative because your Y axis is inverted
+    wrapper.style.top = `${-y * (canvasSize + gap)}px`;
 }
 
-// Update Canvas Map Transform based on currentPan and currentZoom
 function updateCanvasMapTransform() {
     canvasMap.style.transform = `translate(${currentPan.x}px, ${currentPan.y}px) scale(${currentZoom})`;
 }
 
 function addCanvasEventListeners(canvas, canvasObj) {
     canvas.addEventListener('mousedown', (e) => {
-        if (disableDrawing || e.button !== 0) return;  // Only draw with left click (button 0) and when not panning
+        if (disableDrawing || e.button !== 0) return;
         const tool = tools[currentTool];
         if (tool && tool.onMouseDown) {
             tool.onMouseDown(e, canvasObj);
@@ -819,7 +876,7 @@ function addCanvasEventListeners(canvas, canvasObj) {
     });
 
     canvas.addEventListener('mousemove', (e) => {
-        if (disableDrawing || e.buttons !== 1) return;  // Only move with left click and when not panning
+        if (disableDrawing || e.buttons !== 1) return;
         const tool = tools[currentTool];
         if (tool && tool.onMouseMove) {
             tool.onMouseMove(e, canvasObj);
@@ -827,14 +884,13 @@ function addCanvasEventListeners(canvas, canvasObj) {
     });
 
     canvas.addEventListener('mouseup', (e) => {
-        if (disableDrawing || e.button !== 0) return;  // Only trigger mouseup with left click
+        if (disableDrawing || e.button !== 0) return;
         const tool = tools[currentTool];
         if (tool && tool.onMouseUp) {
             tool.onMouseUp(e, canvasObj);
         }
     });
 
-    // Optional: Handle mouse leaving the canvas while drawing
     canvas.addEventListener('mouseleave', (e) => {
         if (disableDrawing) return;
         const tool = tools[currentTool];
@@ -844,7 +900,6 @@ function addCanvasEventListeners(canvas, canvasObj) {
     });
 }
 
-// Listen for global draw-pixel and fill events
 socket.on('draw-pixel', (data) => {
     const { canvasId, x, y, color, size, tool } = data;
     const canvasObj = canvases.get(canvasId);
@@ -854,24 +909,57 @@ socket.on('draw-pixel', (data) => {
     canvasObj.ctx.imageSmoothingEnabled = false;
 
     if (size >= 3) {
-        drawCircle(canvasObj.ctx, x, y, size / 2);
+        drawCircle(canvasObj.ctx, x, y, size / 2, data.pixelInfo, canvasId);
     } else if (size === 2) {
-        drawPlusShape(canvasObj.ctx, x, y);
+        drawPlusShape(canvasObj.ctx, x, y, data.pixelInfo, canvasId);
     } else {
         canvasObj.ctx.fillRect(x, y, 1, 1);
     }
+
+	var key = `${x},${y}`;
+	canvasObj.canvasData[key] = data.pixelInfo;
 });
 
-socket.on('fill', (data) => {
-    const { canvasId, x, y, targetColor, newColor } = data;
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return;
-    floodFill(x, y, targetColor, newColor, canvasId);
-});
-
-// Function to conditionally display/hide arrows based on existing canvases
 function updateArrowsVisibility(x, y) {
     const directions = ['up', 'down', 'left', 'right'];
+    const updateArrowForCell = (x, y) => {
+        directions.forEach(direction => {
+            let neighborX = x;
+            let neighborY = y;
+            switch(direction) {
+                case 'up':
+                    neighborY += 1;
+                    break;
+                case 'down':
+                    neighborY -= 1;
+                    break;
+                case 'left':
+                    neighborX -= 1;
+                    break;
+                case 'right':
+                    neighborX += 1;
+                    break;
+            }
+            const currentWrapper = document.querySelector(`.canvas-wrapper[data-x="${x}"][data-y="${y}"]`);
+            if (currentWrapper) {
+                const arrow = currentWrapper.querySelector(`.arrow.${direction}`);
+                if (canvases.has(generateCanvasId(neighborX, neighborY))) {
+                    if (arrow) {
+                        arrow.style.display = 'none';
+                    }
+                } else {
+                    if (arrow) {
+                        arrow.style.display = 'block';
+                    }
+                }
+            }
+        });
+    };
+
+    // Update the arrows for the current cell
+    updateArrowForCell(x, y);
+
+    // Update the arrows for the neighboring cells
     directions.forEach(direction => {
         let neighborX = x;
         let neighborY = y;
@@ -889,31 +977,15 @@ function updateArrowsVisibility(x, y) {
                 neighborX += 1;
                 break;
         }
-        const currentWrapper = document.querySelector(`.canvas-wrapper[data-x="${x}"][data-y="${y}"]`);
-        if (canvases.has(generateCanvasId(neighborX, neighborY))) {
-            // Hide the arrow if a neighbor canvas exists in this direction
-            const arrow = currentWrapper.querySelector(`.arrow.${direction}`);
-            if (arrow) {
-                arrow.style.display = 'none'; // Hide arrow
-            }
-        } else {
-            // Show the arrow if no neighbor canvas exists in this direction
-            const arrow = currentWrapper.querySelector(`.arrow.${direction}`);
-            if (arrow) {
-                arrow.style.display = 'block'; // Show arrow
-            }
-        }
+        updateArrowForCell(neighborX, neighborY);
     });
 }
 
-// Utility Functions
 
-// Generate a unique canvas ID (based on coordinates)
 function generateCanvasId(x, y) {
     return `${x}|${y}`;
 }
 
-// Get neighboring canvas ID based on direction
 function getNeighborCanvasId(currentId, direction) {
     const [x, y] = currentId.split('|').map(Number);
     switch(direction) {

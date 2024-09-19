@@ -9,11 +9,15 @@ const bodyParser = require('body-parser');
 const path = require('path');
 const sharedsession = require("express-socket.io-session");
 const config = require('./config.json'); // Importing config.json
+const Enmap = require('enmap');
 
 // Replace with your Discord app credentials from config.json
 const DISCORD_CLIENT_ID = config.discord_client_id;
 const DISCORD_CLIENT_SECRET = config.discord_client_secret;
 const CALLBACK_URL = config.callback_url;
+
+// Enmap for storing canvas data
+const canvasEnmap = new Enmap({ name: 'canvases' });
 
 // Session middleware
 const sessionMiddleware = session({
@@ -95,6 +99,13 @@ function getCurrentTimestamp() {
 
 // Canvas object structure
 function createCanvas(canvasId) {
+    // Check if the canvas already exists in Enmap
+    const savedCanvas = canvasEnmap.get(canvasId);
+    if (savedCanvas) {
+        return savedCanvas; // Load from Enmap if it exists
+    }
+
+    // Otherwise, create a new canvas
     return {
         id: canvasId,
         edited: false,
@@ -104,12 +115,51 @@ function createCanvas(canvasId) {
     };
 }
 
+// Save interval setup
+const saveInterval = 60000; // Save every 60 seconds
+let saveTimeouts = new Map(); // To track timeouts per canvas
+
+// Function to periodically save canvases with changes
+function saveAllCanvases() {
+    canvases.forEach((canvas, canvasId) => {
+        if (canvas.edited) {
+            canvasEnmap.set(canvasId, canvas);
+            canvas.edited = false; // Mark as saved
+            console.log(`Canvas ${canvasId} saved.`);
+        }
+    });
+}
+
+// Set interval to save all canvases periodically
+setInterval(saveAllCanvases, saveInterval);
+
+// Canvas expiration and cleanup
+const canvasExpirationTime = 3600; // 1 hour
+
+function cleanupInactiveCanvases() {
+    const currentTime = getCurrentTimestamp();
+    canvases.forEach((canvas, canvasId) => {
+        if (currentTime - canvas.lastAccessed > canvasExpirationTime) {
+            canvases.delete(canvasId);
+            canvasEnmap.delete(canvasId); // Optionally remove from Enmap
+            console.log(`Canvas ${canvasId} deleted due to inactivity.`);
+        }
+    });
+}
+
+// Set interval to clean up inactive canvases every 10 minutes
+setInterval(cleanupInactiveCanvases, 600000); // 10 minutes
+
 io.on('connection', (socket) => {
     console.log('A user connected');
 
     // Access the session
     const session = socket.handshake.session;
     let currentCanvasId = null;
+
+    function isAuthenticated() {
+        return session && session.passport && session.passport.user;
+    }
 
     // Join a canvas based on canvasId
     socket.on('join-canvas', (data) => {
@@ -121,6 +171,12 @@ io.on('connection', (socket) => {
         if (!canvas) {
             // Create a new canvas
             canvas = createCanvas(canvasId);
+
+			if(!isAuthenticated() && !canvas.edited){
+				// do not allow
+				socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
+				return;
+			}
             canvases.set(canvasId, canvas);
         }
 
@@ -156,7 +212,7 @@ io.on('connection', (socket) => {
             canvases.set(canvasId, canvas);
         }
 
-        // Mark canvas as edited
+        // Mark canvas as edited and update last accessed
         canvas.edited = true;
         canvas.lastAccessed = getCurrentTimestamp();
 
@@ -171,14 +227,13 @@ io.on('connection', (socket) => {
 
         for (let dx = -radius; dx <= radius; dx++) {
             for (let dy = -radius; dy <= radius; dy++) {
-				if (size >= 3) {
-					// Use a slightly tighter condition to avoid pixel extrusions
-					if (dx * dx + dy * dy <= radius * radius - radius * 0.2) {
-						const pixelX = x + dx;
-						const pixelY = y + dy;
-						const key = `${pixelX},${pixelY}`;
-						canvasData[key] = { color: color, user, timestamp };
-					}
+                if (size >= 3) {
+                    if (dx * dx + dy * dy <= radius * radius - radius * 0.2) {
+                        const pixelX = x + dx;
+                        const pixelY = y + dy;
+                        const key = `${pixelX},${pixelY}`;
+                        canvasData[key] = { color: color, user, timestamp };
+                    }
                 } else if (size === 2) {
                     if (dx === 0 || dy === 0) {
                         const pixelX = x + dx;
@@ -193,45 +248,10 @@ io.on('connection', (socket) => {
             }
         }
 
+        data.pixelInfo = { color: color, user, timestamp };
+
         // Broadcast to all other clients in the same canvas
         socket.to(`canvas-${canvasId}`).emit('draw-pixel', data);
-    });
-
-    // Listen for fill events
-    socket.on('fill', (data) => {
-        const { canvasId, x, y, targetColor, newColor } = data;
-
-        // Authentication check
-        if (!session.passport || !session.passport.user) {
-            socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
-            return;
-        }
-
-        // Ensure the canvas exists
-        let canvas = canvases.get(canvasId);
-        if (!canvas) {
-            // Create a new canvas
-            canvas = createCanvas(canvasId);
-            canvases.set(canvasId, canvas);
-        }
-
-        // Mark canvas as edited
-        canvas.edited = true;
-        canvas.lastAccessed = getCurrentTimestamp();
-
-        // Update the canvas data using flood fill
-        const canvasData = canvas.data;
-        const timestamp = Date.now();
-        const user = {
-            id: session.passport.user.id,
-            username: session.passport.user.username
-        };
-        floodFillServer(canvasData, x, y, targetColor, newColor, user, timestamp);
-
-        // Broadcast to all clients in the same canvas
-        data.user = user;
-        data.timestamp = timestamp;
-        io.to(`canvas-${canvasId}`).emit('fill', data);
     });
 
     // Listen for canvas save events (optional)
@@ -263,28 +283,6 @@ io.on('connection', (socket) => {
         }
     });
 });
-
-// Server-side flood fill algorithm
-function floodFillServer(canvasData, x, y, targetColor, newColor, user, timestamp) {
-    const stack = [];
-    stack.push({ x: x, y: y });
-
-    while (stack.length > 0) {
-        const { x, y } = stack.pop();
-        const key = `${x},${y}`;
-
-        if (x < 0 || x >= 512 || y < 0 || y >= 512) continue;
-        if (canvasData[key] && canvasData[key].color.toLowerCase() !== targetColor.toLowerCase()) continue;
-        if (canvasData[key] && canvasData[key].color.toLowerCase() === newColor.toLowerCase()) continue; // Already filled
-
-        canvasData[key] = { color: newColor, user, timestamp };
-
-        stack.push({ x: x + 1, y: y });
-        stack.push({ x: x - 1, y: y });
-        stack.push({ x: x, y: y + 1 });
-        stack.push({ x: x, y: y - 1 });
-    }
-}
 
 const PORT = process.env.PORT || 3000;
 http.listen(PORT, () => {
