@@ -133,8 +133,9 @@ function saveAllCanvases() {
 // Set interval to save all canvases periodically
 setInterval(saveAllCanvases, saveInterval);
 
-// Canvas expiration and cleanup
-const canvasExpirationTime = 3600; // 1 hour
+// Canvas expiration and cleanup 48 hours
+/*
+const canvasExpirationTime = 48 * 60 * 60; // 48 hours in seconds
 
 function cleanupInactiveCanvases() {
     const currentTime = getCurrentTimestamp();
@@ -147,8 +148,8 @@ function cleanupInactiveCanvases() {
     });
 }
 
-// Set interval to clean up inactive canvases every 10 minutes
-setInterval(cleanupInactiveCanvases, 600000); // 10 minutes
+setInterval(cleanupInactiveCanvases, 48 * 60 * 60 * 1000); // Cleanup every 48 hours
+*/
 
 io.on('connection', (socket) => {
     console.log('A user connected');
@@ -166,6 +167,8 @@ io.on('connection', (socket) => {
         const { canvasId } = data;
         currentCanvasId = canvasId;
 
+		console.log(`User ${session.id} joined canvas ${canvasId}`);
+
         // Ensure the canvas exists
         let canvas = canvases.get(canvasId);
         if (!canvas) {
@@ -180,6 +183,13 @@ io.on('connection', (socket) => {
             canvases.set(canvasId, canvas);
         }
 
+		// make sure user is not in the room
+		if(socket.rooms.has(`canvas-${canvasId}`)){
+			return;
+		}
+
+		console.log(`User ${session.id} joined canvas ${canvasId}`);
+
         // Update last accessed time and increment viewers
         canvas.lastAccessed = getCurrentTimestamp();
         canvas.viewers++;
@@ -193,6 +203,33 @@ io.on('connection', (socket) => {
         // Notify all clients about the updated canvas list
         io.emit('update-canvas-list', { canvasList: Array.from(canvases.keys()) });
     });
+
+	// leave a canvas
+	socket.on('leave-canvas', (data) => {
+		const { canvasId } = data;
+		currentCanvasId = null;
+
+		console.log(`User ${session.id} left canvas ${canvasId}`);
+
+		// Ensure the canvas exists
+		let canvas = canvases.get(canvasId);
+		if (canvas) {
+
+			// make sure user is in the room
+			if(!socket.rooms.has(`canvas-${canvasId}`)){
+				return;
+			}
+
+			// Decrement viewers
+			canvas.viewers--;
+
+			// Leave the Socket.IO room for this canvas
+			socket.leave(`canvas-${canvasId}`);
+
+			console.log(`User ${session.id} left canvas ${canvasId}`);
+		}
+	});
+
 
     // Listen for drawing events
     socket.on('draw-pixel', (data) => {
@@ -228,7 +265,7 @@ io.on('connection', (socket) => {
         for (let dx = -radius; dx <= radius; dx++) {
             for (let dy = -radius; dy <= radius; dy++) {
                 if (size >= 3) {
-                    if (dx * dx + dy * dy <= radius * radius - radius * 0.2) {
+                    if (dx * dx + dy * dy <= radius * radius - radius * 0.8) {
                         const pixelX = x + dx;
                         const pixelY = y + dy;
                         const key = `${pixelX},${pixelY}`;
