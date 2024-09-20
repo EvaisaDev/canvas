@@ -55,10 +55,13 @@ class Tool {
 
 // Drawing Tool (Handles Pencil and Eraser)
 class DrawingTool extends Tool {
-    constructor(name, isEraser = false) {
+    constructor(name, isEraser = false, extra_data = {}) {
         super(name);
         this.isEraser = isEraser;
         this.lastPosition = null;
+		this.extra_data = {
+			targetColor: null
+		};
     }
 
 	
@@ -99,7 +102,7 @@ class DrawingTool extends Tool {
     plotPoint(canvasObj, x, y, drawColor) {
         // Plot within current canvas
         const adjustedColor = this.isEraser ? '#FFFFFF' : drawColor;
-        drawPixel(canvasObj, x, y, adjustedColor);
+        drawPixel(canvasObj, x, y, adjustedColor, this.extra_data.targetColor);
 
         // Emit draw event
         socket.emit('draw', {
@@ -109,6 +112,7 @@ class DrawingTool extends Tool {
             color: adjustedColor,
             size: pencilSize,
             tool: this.name,
+			extra_data: this.extra_data,
             user: userInfo,
             timestamp: Date.now()
         });
@@ -128,6 +132,25 @@ class DrawingTool extends Tool {
     }
 }
 
+class MarkerTool extends DrawingTool {
+	constructor(name, isEraser = false, extra_data = {}) {
+		super(name, isEraser, extra_data);
+	}
+
+	onMouseDown(e, canvasObj) {
+        if (!isAuthenticated) return;
+        isDrawing = true;
+        currentCanvasObj = canvasObj;
+        const { x, y } = getCanvasCoordinates(e, canvasObj);
+        this.lastPosition = { x, y };
+
+		const targetColor = getPixelColor(canvasObj.id, x, y);
+		this.extra_data.targetColor = targetColor;
+        const drawColor = this.isEraser ? '#FFFFFF' : currentColor;
+        this.plotPoint(canvasObj, x, y, drawColor);
+	}
+}
+
 // Color Picker Tool
 class ColorPickerTool extends Tool {
     constructor(name) {
@@ -145,6 +168,7 @@ class ColorPickerTool extends Tool {
 // Initialize Tools
 const tools = {
     'pencil': new DrawingTool('pencil'),
+	'highlighter': new MarkerTool('highlighter'),
     'eraser': new DrawingTool('eraser', true),
     'color-picker': new ColorPickerTool('color-picker')
 };
@@ -239,12 +263,12 @@ function getNeighborCanvasId(currentId, direction) {
  * @param {number} y - Y-coordinate
  * @param {string} color - Color to draw
  */
-function drawPixel(canvasObj, x, y, color) {
+function drawPixel(canvasObj, x, y, color, targetColor = null) {
     const ctx = canvasObj.ctx;
     ctx.fillStyle = color;
     ctx.imageSmoothingEnabled = false;
 
-    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id);
+    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id, targetColor);
 }
 
 /**
@@ -256,7 +280,7 @@ function drawPixel(canvasObj, x, y, color) {
  * @param {string} color - Color to draw
  * @param {string} canvasId - ID of the canvas
  */
-function drawBrush(ctx, x, y, size, color, canvasId) {
+function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null) {
     const canvasObj = canvases.get(canvasId);
     if (!canvasObj) return;
 
@@ -268,7 +292,15 @@ function drawBrush(ctx, x, y, size, color, canvasId) {
         for (let xOffset = 0; xOffset < size; xOffset++) {
             const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
             if (distance < radius) {
-                ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+
+				if (targetColor == null) {
+                	ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+				} else {
+					// only draw if the pixel is the target color
+					if (getPixelColor(canvasId, x + xOffset - radius + 1, y + yOffset - radius + 1) == targetColor) {
+						ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+					}
+				}
             }
         }
     }
@@ -1036,7 +1068,7 @@ window.onload = () => {
 
     // Handle incoming draw-pixel events
     socket.on('draw', (data) => {
-        const { canvasId, x, y, color, size, tool, user, timestamp } = data;
+        const { canvasId, x, y, color, size, tool, extra_data, user, timestamp } = data;
         const canvasObj = canvases.get(canvasId);
         if (!canvasObj) return;
 
@@ -1044,7 +1076,7 @@ window.onload = () => {
         canvasObj.ctx.imageSmoothingEnabled = false;
 
         
-        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId);
+        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId, extra_data.targetColor);
      
     });
 };

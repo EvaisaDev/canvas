@@ -1,60 +1,75 @@
 const express = require('express');
-const app = express();
-const http = require('http').createServer(app);
-const io = require('socket.io')(http);
+const http = require('http');
+const socketIo = require('socket.io');
 const session = require('express-session');
 const passport = require('passport');
 const DiscordStrategy = require('passport-discord').Strategy;
 const bodyParser = require('body-parser');
 const path = require('path');
-const sharedsession = require("express-socket.io-session");
-const config = require('./config.json'); // Importing config.json
+const sharedsession = require('express-socket.io-session');
 const Enmap = require('enmap');
+const config = require('./config.json');
 
-// Replace with your Discord app credentials from config.json
-const DISCORD_CLIENT_ID = config.discord_client_id;
-const DISCORD_CLIENT_SECRET = config.discord_client_secret;
-const CALLBACK_URL = config.callback_url;
-
-// Enmap for storing canvas data
-const canvasEnmap = new Enmap({ name: 'canvases' });
-
-// Session middleware
-const sessionMiddleware = session({
-    secret: config.session_secret, // Replace with your session secret (use a strong, unique value)
-    resave: false,
-    saveUninitialized: false
+// Initialize Express app
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    maxHttpBufferSize: 1e8, // Increase if necessary
+    pingTimeout: 60000,     // Adjust as needed
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-app.use(sessionMiddleware);
+// Discord OAuth2 Credentials
+const {
+    discord_client_id,
+    discord_client_secret,
+    callback_url,
+    session_secret,
+    port
+} = config;
 
-// Initialize Passport
+// Initialize Enmap for storing canvas data
+const canvasEnmap = new Enmap({ name: 'canvases' });
+
+// Session middleware configuration
+const sessionMiddleware = session({
+    secret: session_secret,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { maxAge: 86400000 } // 1 day
+});
+
+// Apply middlewares
+app.use(sessionMiddleware);
+app.use(bodyParser.json());
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Passport serialization
-passport.serializeUser((user, done) => {
-    done(null, user);
-});
+// Share session with Socket.IO
+io.use(sharedsession(sessionMiddleware, {
+    autoSave: true
+}));
 
-passport.deserializeUser((obj, done) => {
-    done(null, obj);
-});
+// Passport serialization
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((obj, done) => done(null, obj));
 
 // Configure Discord Strategy
 passport.use(new DiscordStrategy({
-    clientID: DISCORD_CLIENT_ID,
-    clientSecret: DISCORD_CLIENT_SECRET,
-    callbackURL: CALLBACK_URL,
+    clientID: discord_client_id,
+    clientSecret: discord_client_secret,
+    callbackURL: callback_url,
     scope: ['identify']
 },
 (accessToken, refreshToken, profile, done) => {
-    process.nextTick(() => {
-        return done(null, profile);
-    });
+    return done(null, profile);
 }));
 
-// Routes for authentication
+// Authentication Routes
 app.get('/auth/discord', passport.authenticate('discord'));
 
 app.get('/auth/discord/callback',
@@ -78,226 +93,185 @@ app.get('/logout', (req, res) => {
     });
 });
 
-// Body parser
-app.use(bodyParser.json());
-
-// Static files
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Share session with Socket.IO
-io.use(sharedsession(sessionMiddleware, {
-    autoSave: true
-}));
-
-// Map to store canvas data, key: "x-y", value: canvas object
+// In-memory canvas storage
 const canvases = new Map();
 
-// Helper function to get current timestamp
-function getCurrentTimestamp() {
-    return Math.floor(Date.now() / 1000);
-}
+// Helper: Get current timestamp in seconds
+const getCurrentTimestamp = () => Math.floor(Date.now() / 1000);
 
-// Canvas object structure
-function createCanvas(canvasId) {
-    // Check if the canvas already exists in Enmap
-    const savedCanvas = canvasEnmap.get(canvasId);
-    if (savedCanvas) {
-        return savedCanvas; // Load from Enmap if it exists
+// Initialize canvases from Enmap
+const loadAllCanvases = () => {
+    canvasEnmap.forEach((canvas, canvasId) => {
+        canvases.set(canvasId, canvas);
+        console.log(`Canvas ${canvasId} loaded.`);
+    });
+};
+
+// Create or retrieve a canvas
+const createOrGetCanvas = (canvasId) => {
+    let canvas = canvases.get(canvasId);
+    if (!canvas) {
+        canvas = canvasEnmap.get(canvasId) || {
+            id: canvasId,
+            edited: false,
+            data: {},
+            lastAccessed: getCurrentTimestamp(),
+            viewers: 0
+        };
+        canvases.set(canvasId, canvas);
     }
+    return canvas;
+};
 
-    // Otherwise, create a new canvas
-    return {
-        id: canvasId,
-        edited: false,
-        data: {}, // key: "x,y", value: { color, user, timestamp }
-        lastAccessed: getCurrentTimestamp(),
-        viewers: 0,
-    };
-}
-
-// Save interval setup
-const saveInterval = 60000; // Save every 60 seconds
-// Function to periodically save canvases with changes
-function saveAllCanvases() {
+// Periodically save edited canvases to Enmap
+const SAVE_INTERVAL = 60000; // 60 seconds
+const saveAllCanvases = () => {
     canvases.forEach((canvas, canvasId) => {
         if (canvas.edited) {
             canvasEnmap.set(canvasId, canvas);
-            canvas.edited = false; // Mark as saved
+            canvas.edited = false;
             console.log(`Canvas ${canvasId} saved.`);
         }
     });
-}
+};
 
-function loadAllCanvases() {
-	canvasEnmap.forEach((canvas, canvasId) => {
-		canvases.set(canvasId, canvas);
-		console.log(`Canvas ${canvasId} loaded.`);
-	});
-}
-
+// Load existing canvases and set save interval
 loadAllCanvases();
+setInterval(saveAllCanvases, SAVE_INTERVAL);
 
-// Set interval to save all canvases periodically
-setInterval(saveAllCanvases, saveInterval);
-
-
+// Socket.IO connection handler
 io.on('connection', (socket) => {
     console.log('A user connected');
 
-    // Access the session
     const session = socket.handshake.session;
     let currentCanvasId = null;
 
-    function isAuthenticated() {
-        return session && session.passport && session.passport.user;
-    }
+    const isAuthenticated = () => session?.passport?.user;
 
-    // Join a canvas based on canvasId
-    socket.on('join-canvas', (data) => {
-        const { canvasId } = data;
-        currentCanvasId = canvasId;
-
-		console.log(`User ${session.id} joined canvas ${canvasId}`);
-
-        // Ensure the canvas exists
-        let canvas = canvases.get(canvasId);
-        if (!canvas) {
-            // Create a new canvas
-            canvas = createCanvas(canvasId);
-
-			if(!isAuthenticated() && !canvas.edited){
-				// do not allow
-				socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
-				return;
-			}
-            canvases.set(canvasId, canvas);
+    // Join a canvas
+    socket.on('join-canvas', ({ canvasId }) => {
+        if (!canvasId) {
+            socket.emit('error', { message: 'Canvas ID is required.' });
+            return;
         }
 
-		// make sure user is not in the room
-		if(socket.rooms.has(`canvas-${canvasId}`)){
-			return;
-		}
+        const canvas = createOrGetCanvas(canvasId);
 
-		console.log(`User ${session.id} joined canvas ${canvasId}`);
-
-        // Update last accessed time and increment viewers
-        canvas.lastAccessed = getCurrentTimestamp();
-        canvas.viewers++;
-
-        // Join the Socket.IO room for this canvas
-        socket.join(`canvas-${canvasId}`);
-
-        // Send the current canvas data to the user
-        socket.emit('init-canvas', { canvasId, canvasData: canvas.data });
-
-        // Notify all clients about the updated canvas list
-        io.emit('update-canvas-list', { canvasList: Array.from(canvases.keys()) });
-    });
-
-	// leave a canvas
-	socket.on('leave-canvas', (data) => {
-		const { canvasId } = data;
-		currentCanvasId = null;
-
-		console.log(`User ${session.id} left canvas ${canvasId}`);
-
-		// Ensure the canvas exists
-		let canvas = canvases.get(canvasId);
-		if (canvas) {
-
-			// make sure user is in the room
-			if(!socket.rooms.has(`canvas-${canvasId}`)){
-				return;
-			}
-
-			// Decrement viewers
-			canvas.viewers--;
-
-			// Leave the Socket.IO room for this canvas
-			socket.leave(`canvas-${canvasId}`);
-
-			console.log(`User ${session.id} left canvas ${canvasId}`);
-		}
-	});
-
-
-    // Listen for drawing events
-    socket.on('draw', (data) => {
-        const { canvasId, x, y, color, size, tool } = data;
-
-        // Authentication check
-        if (!session.passport || !session.passport.user) {
+        if (!isAuthenticated() && Object.keys(canvas.data).length === 0) {
             socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
             return;
         }
 
-		console.log(`User ${session.id} drew on canvas ${canvasId}`);
+        // Prevent multiple joins to the same canvas
+        if (socket.rooms.has(`canvas-${canvasId}`)) return;
 
-        // Ensure the canvas exists
-        let canvas = canvases.get(canvasId);
-        if (!canvas) {
-            // Create a new canvas
-            canvas = createCanvas(canvasId);
-            canvases.set(canvasId, canvas);
+        currentCanvasId = canvasId;
+        socket.join(`canvas-${canvasId}`);
+        canvas.viewers++;
+        canvas.lastAccessed = getCurrentTimestamp();
+
+        socket.emit('init-canvas', { canvasId, canvasData: canvas.data });
+        io.emit('update-canvas-list', { canvasList: Array.from(canvases.keys()) });
+
+        console.log(`User ${session.id} joined canvas ${canvasId}`);
+    });
+
+    // Leave a canvas
+    socket.on('leave-canvas', ({ canvasId }) => {
+        if (!canvasId || !canvases.has(canvasId)) return;
+
+        const canvas = canvases.get(canvasId);
+        if (socket.rooms.has(`canvas-${canvasId}`)) {
+            socket.leave(`canvas-${canvasId}`);
+            canvas.viewers = Math.max(0, canvas.viewers - 1);
+            currentCanvasId = null;
+
+            console.log(`User ${session.id} left canvas ${canvasId}`);
+        }
+    });
+
+    // Handle drawing
+    socket.on('draw', (data) => {
+        const { canvasId, x, y, color, size, extra_data } = data;
+
+        if (!isAuthenticated()) {
+            socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
+            return;
         }
 
-        // Mark canvas as edited and update last accessed
+        if (!canvasId || !canvases.has(canvasId)) {
+            socket.emit('error', { message: 'Canvas does not exist.' });
+            return;
+        }
+
+        const canvas = canvases.get(canvasId);
         canvas.edited = true;
         canvas.lastAccessed = getCurrentTimestamp();
 
-        // Update the canvas data
-        const canvasData = canvas.data;
-        const timestamp = Date.now();
         const user = {
             id: session.passport.user.id,
             username: session.passport.user.username
         };
 
-		const radius = size / 2;
-		const center = radius - 0.5;
-		for (let yOffset = 0; yOffset < size; yOffset++) {
-			for (let xOffset = 0; xOffset < size; xOffset++) {
-				const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
-				if (distance < radius) {
-					const pixelX = x + xOffset - radius + 1;
-					const pixelY = y + yOffset - radius + 1;
-					const key = `${pixelX},${pixelY}`;
-					canvasData[key] = { color: color, user, timestamp };
-				}
-			}
-		}
+        const radius = size / 2;
+        const radiusSquared = radius * radius;
+        const center = radius - 0.5;
 
+        const canvasData = canvas.data;
+        const timestamp = Date.now();
 
+        for (let yOffset = 0; yOffset < size; yOffset++) {
+            for (let xOffset = 0; xOffset < size; xOffset++) {
+                const dx = xOffset - center;
+                const dy = yOffset - center;
+                if ((dx * dx) + (dy * dy) < radiusSquared) {
+                    const pixelX = x + xOffset - Math.floor(radius) + 1;
+                    const pixelY = y + yOffset - Math.floor(radius) + 1;
+                    const key = `${pixelX},${pixelY}`;
 
-        data.pixelInfo = { color: color, user, timestamp };
+                    if (extra_data?.targetColor) {
+                        const existingPixel = canvasData[key];
+                        if ((existingPixel && existingPixel.color !== extra_data.targetColor) ||
+                            (!existingPixel && extra_data.targetColor !== "#ffffff")) {
+                            continue;
+                        }
+                    }
 
-        // Broadcast to all other clients in the same canvas
-        socket.to(`canvas-${canvasId}`).emit('draw', data);
-    });
-
-    // Listen for canvas save events (optional)
-    socket.on('save-canvas', (data) => {
-        const { canvasId, canvasData: newCanvasData } = data;
-        let canvas = canvases.get(canvasId);
-        if (canvas) {
-            canvas.data = newCanvasData;
-            canvas.edited = true;
-            canvas.lastAccessed = getCurrentTimestamp();
+                    canvasData[key] = { color, user, timestamp };
+                }
+            }
         }
+
+        const pixelInfo = { color, user, timestamp };
+        io.to(`canvas-${canvasId}`).emit('draw', { canvasId, pixelInfo });
     });
 
-    // Provide the canvas list to clients
+    // Handle canvas save (optional)
+    socket.on('save-canvas', ({ canvasId, canvasData }) => {
+        if (!canvasId || !canvases.has(canvasId)) return;
+
+        const canvas = canvases.get(canvasId);
+        canvas.data = canvasData;
+        canvas.edited = true;
+        canvas.lastAccessed = getCurrentTimestamp();
+    });
+
+    // Provide canvas list
     socket.on('request-canvas-list', () => {
         socket.emit('update-canvas-list', { canvasList: Array.from(canvases.keys()) });
     });
 
     // Handle disconnection
     socket.on('disconnect', () => {
+        if (currentCanvasId && canvases.has(currentCanvasId)) {
+            const canvas = canvases.get(currentCanvasId);
+            canvas.viewers = Math.max(0, canvas.viewers - 1);
+        }
         console.log('A user disconnected');
     });
 });
 
-const PORT = process.env.PORT || config.port;
-http.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+// Start the server
+server.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
 });
