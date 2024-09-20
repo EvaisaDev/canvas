@@ -9,7 +9,8 @@ const path = require('path');
 const sharedsession = require('express-socket.io-session');
 const Enmap = require('enmap');
 const config = require('./config.json');
-
+const { createCanvas, loadImage } = require('canvas')
+const { PassThrough } = require('stream');
 // Initialize Express app
 const app = express();
 const server = http.createServer(app);
@@ -102,6 +103,57 @@ const getCurrentTimestamp = () => Math.floor(Date.now() / 1000);
 // Initialize canvases from Enmap
 const loadAllCanvases = () => {
     canvasEnmap.forEach((canvas, canvasId) => {
+		
+		// create internal canvas reference
+		canvas.internalCanvas = createCanvas(512, 512);
+		canvas.internalCtx = canvas.internalCanvas.getContext('2d');
+
+		// fill with color
+		canvas.internalCtx.fillStyle = "#ffffff";
+		canvas.internalCtx.fillRect(0, 0, 512, 512);
+
+		// if imageFileName, check if file exists
+		if (canvas.imageFileName) {
+			const fs = require('fs');
+			if (!fs.existsSync(canvas.imageFileName)) {
+				console.log("Image file not found, skipping: ", canvas.imageFileName);
+				canvas.imageFileName = null;
+			}
+		}
+
+		if(canvas.imageFileName){
+			console.log("Loading image from file: ", canvas.imageFileName);
+			loadImage(canvas.imageFileName).then((image) => {
+				canvas.internalCtx.drawImage(image, 0, 0);
+			});
+		}else{
+			// draw all pixels
+			for (const key in canvas.data) {
+				const pixel = canvas.data[key];
+				const [x, y] = key.split(',').map(Number);
+
+				// draw 1x1 pixel without using brush function
+				canvas.internalCtx.fillStyle = pixel.color;
+				canvas.internalCtx.fillRect(x, y, 1, 1);
+			}
+
+			// write image to file with key as name
+			const fs = require('fs');
+			// create a folder for canvases
+			const folder = './canvases';
+			if (!fs.existsSync(folder)) {
+				fs.mkdirSync(folder);
+			}
+
+			canvas.imageFileName = `./canvases/${canvasId.replace("|", "-")}.png`;
+
+			const out = fs.createWriteStream(canvas.imageFileName);
+			const stream = canvas.internalCanvas.createPNGStream();
+			stream.pipe(out);
+			out.on('finish', () =>  console.log('The PNG file was created.'));
+			out.on('error', console.error);
+		}
+
         canvases.set(canvasId, canvas);
         console.log(`Canvas ${canvasId} loaded.`);
     });
@@ -120,6 +172,48 @@ const createOrGetCanvas = (canvasId) => {
         };
         canvases.set(canvasId, canvas);
     }
+
+	// create internal canvas reference
+	canvas.internalCanvas = createCanvas(512, 512);
+	canvas.internalCtx = canvas.internalCanvas.getContext('2d');
+
+	// fill with color
+	canvas.internalCtx.fillStyle = "#ffffff";
+	canvas.internalCtx.fillRect(0, 0, 512, 512);
+
+	if(canvas.imageFileName){
+		console.log("Loading image from file: ", canvas.imageFileName);
+		loadImage(canvas.imageFileName).then((image) => {
+			canvas.internalCtx.drawImage(image, 0, 0);
+		});
+	}else{
+		// draw all pixels
+		for (const key in canvas.data) {
+			const pixel = canvas.data[key];
+			const [x, y] = key.split(',').map(Number);
+
+			// draw 1x1 pixel without using brush function
+			canvas.internalCtx.fillStyle = pixel.color;
+			canvas.internalCtx.fillRect(x, y, 1, 1);
+		}
+
+		// write image to file with key as name
+		const fs = require('fs');
+		// create a folder for canvases
+		const folder = './canvases';
+		if (!fs.existsSync(folder)) {
+			fs.mkdirSync(folder);
+		}
+
+		canvas.imageFileName = `./canvases/${canvasId.replace("|", "-")}.png`;
+
+		const out = fs.createWriteStream(canvas.imageFileName);
+		const stream = canvas.internalCanvas.createPNGStream();
+		stream.pipe(out);
+		out.on('finish', () =>  console.log('The PNG file was created.'));
+		out.on('error', console.error);
+	}
+
     return canvas;
 };
 
@@ -128,7 +222,21 @@ const SAVE_INTERVAL = 60000; // 60 seconds
 const saveAllCanvases = () => {
     canvases.forEach((canvas, canvasId) => {
         if (canvas.edited) {
-            canvasEnmap.set(canvasId, canvas);
+
+			// save to file
+			const fs = require('fs');
+			const out = fs.createWriteStream(canvas.imageFileName);
+			const stream = canvas.internalCanvas.createPNGStream();
+			stream.pipe(out);
+			out.on('finish', () =>  console.log('The PNG file was created.'));
+			out.on('error', console.error);
+
+			// create canvas data, remove internal canvas
+			let canvasClone = {...canvas};
+			delete canvasClone.internalCanvas;
+			delete canvasClone.internalCtx;
+
+            canvasEnmap.set(canvasId, canvasClone);
             canvas.edited = false;
             console.log(`Canvas ${canvasId} saved.`);
         }
@@ -149,35 +257,59 @@ io.on('connection', (socket) => {
     const isAuthenticated = () => session?.passport?.user;
 
     // Join a canvas
-    socket.on('join-canvas', ({ canvasId }) => {
-        if (!canvasId) {
-            socket.emit('error', { message: 'Canvas ID is required.' });
-            return;
-        }
-
-        const canvas = createOrGetCanvas(canvasId);
-
-        if (!isAuthenticated() && Object.keys(canvas.data).length === 0) {
-            socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
-            return;
-        }
-
-        // Prevent multiple joins to the same canvas
-        if (socket.rooms.has(`canvas-${canvasId}`)) return;
-
-        currentCanvasId = canvasId;
-        socket.join(`canvas-${canvasId}`);
-        canvas.viewers++;
-        canvas.lastAccessed = getCurrentTimestamp();
-
-        socket.emit('init-canvas', { canvasId, canvasData: canvas.data });
-        io.emit('update-canvas-list', { canvasList: Array.from(canvases.keys()) });
-
-        console.log(`User ${session.id} joined canvas ${canvasId}`);
-    });
+	socket.on('join-canvas', async ({ canvasId }) => {
+		if (!canvasId) {
+			socket.emit('error', { message: 'Canvas ID is required.' });
+			return;
+		}
+	
+		const canvas = createOrGetCanvas(canvasId);
+	
+		if (!isAuthenticated() && Object.keys(canvas.data).length === 0) {
+			socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
+			return;
+		}
+	
+		// Prevent multiple joins to the same canvas
+		if (socket.rooms.has(`canvas-${canvasId}`)) return;
+	
+		currentCanvasId = canvasId;
+		socket.join(`canvas-${canvasId}`);
+		canvas.viewers++;
+		canvas.lastAccessed = getCurrentTimestamp();
+	
+		// Ensure the canvas has finished drawing
+		// Forcing the canvas to wait for the complete rendering of all drawings if needed
+		await new Promise((resolve) => {
+			setTimeout(resolve, 100); // Adjust delay if necessary to ensure the canvas has time to render
+		});
+	
+		// Create PNG in-memory stream
+		const passthrough = new PassThrough();
+		const buffers = [];
+	
+		passthrough.on('data', (chunk) => buffers.push(chunk));
+		passthrough.on('end', () => {
+			const binaryImage = Buffer.concat(buffers);
+	
+			// Emit canvas data with the in-memory image
+			socket.emit('init-canvas', { canvasId, canvasData: canvas.data, imageBlob: binaryImage });
+			socket.emit('update-canvas-list', { canvasList: Array.from(canvases.keys()) });
+	
+			console.log(`User ${session.id} joined canvas ${canvasId}`);
+		});
+	
+		passthrough.on('error', (error) => {
+			console.error('Error creating PNG stream:', error);
+			socket.emit('error', { message: 'Error generating image.' });
+		});
+	
+		// Pipe the canvas PNG stream into the passthrough
+		canvas.internalCanvas.createPNGStream().pipe(passthrough);
+	});
 
     // Leave a canvas
-    socket.on('leave-canvas', ({ canvasId }) => {
+    socket.on('leave-canvas', async ({ canvasId }) => {
         if (!canvasId || !canvases.has(canvasId)) return;
 
         const canvas = canvases.get(canvasId);
@@ -191,7 +323,7 @@ io.on('connection', (socket) => {
     });
 
     // Handle drawing
-    socket.on('draw', (data) => {
+    socket.on('draw', async (data) => {
         const { canvasId, x, y, color, size, extra_data } = data;
 
         if (!isAuthenticated()) {
@@ -242,8 +374,11 @@ io.on('connection', (socket) => {
             }
         }
 
+		// Draw on the internal canvas
+		drawBrush(canvas.internalCtx, x, y, size, color, canvasId, extra_data?.targetColor);
+
         const pixelInfo = { color, user, timestamp };
-        io.to(`canvas-${canvasId}`).emit('draw', { canvasId, pixelInfo });
+        io.to(`canvas-${canvasId}`).emit('draw', { ...data, user, timestamp });
     });
 
     // Handle canvas save (optional)
@@ -270,6 +405,50 @@ io.on('connection', (socket) => {
         console.log('A user disconnected');
     });
 });
+
+/**
+ * Draws a circular brush with configurable pixel size.
+ * @param {CanvasRenderingContext2D} ctx - Canvas context
+ * @param {number} x - X-coordinate
+ * @param {number} y - Y-coordinate
+ * @param {number} size - Radius of the brush
+ * @param {string} color - Color to draw
+ * @param {string} canvasId - ID of the canvas
+ */
+function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null) {
+    ctx.fillStyle = color;
+    const radius = size / 2;
+    const center = radius - 0.5;
+
+    for (let yOffset = 0; yOffset < size; yOffset++) {
+        for (let xOffset = 0; xOffset < size; xOffset++) {
+            const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
+            if (distance < radius) {
+
+				if (targetColor == null) {
+                	ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+				} else {
+					// only draw if the pixel is the target color
+					if (getPixelColor(ctx, x + xOffset - radius + 1, y + yOffset - radius + 1) == targetColor) {
+						ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+					}
+				}
+            }
+        }
+    }
+}
+
+function getPixelColor(ctx, x, y) {
+    if (!ctx) return '#FFFFFF';
+
+    try {
+        const pixelData = ctx.getImageData(x, y, 1, 1).data;
+        return `#${((1 << 24) + (pixelData[0] << 16) + (pixelData[1] << 8) + pixelData[2]).toString(16).slice(1)}`;
+    } catch (error) {
+        console.error('Error getting pixel color:', error);
+        return '#FFFFFF';
+    }
+}
 
 // Start the server
 server.listen(port, () => {

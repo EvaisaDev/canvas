@@ -102,7 +102,7 @@ class DrawingTool extends Tool {
     plotPoint(canvasObj, x, y, drawColor) {
         // Plot within current canvas
         const adjustedColor = this.isEraser ? '#FFFFFF' : drawColor;
-        drawPixel(canvasObj, x, y, adjustedColor, this.extra_data.targetColor);
+        drawPixel(canvasObj, x, y, adjustedColor, this.extra_data.targetColor, userInfo);
 
         // Emit draw event
         socket.emit('draw', {
@@ -144,7 +144,9 @@ class MarkerTool extends DrawingTool {
         const { x, y } = getCanvasCoordinates(e, canvasObj);
         this.lastPosition = { x, y };
 
-		const targetColor = getPixelColor(canvasObj.id, x, y);
+
+
+		const targetColor = getPixelColor(canvasObj.ctx, x, y);
 		this.extra_data.targetColor = targetColor;
         const drawColor = this.isEraser ? '#FFFFFF' : currentColor;
         this.plotPoint(canvasObj, x, y, drawColor);
@@ -159,7 +161,7 @@ class ColorPickerTool extends Tool {
 
     onMouseDown(e, canvasObj) {
         const { x, y } = getCanvasCoordinates(e, canvasObj);
-        const color = getPixelColor(canvasObj.id, x, y);
+        const color = getPixelColor(canvasObj.ctx, x, y);
         currentColor = color;
         updateColorSwatches(color);
     }
@@ -263,12 +265,12 @@ function getNeighborCanvasId(currentId, direction) {
  * @param {number} y - Y-coordinate
  * @param {string} color - Color to draw
  */
-function drawPixel(canvasObj, x, y, color, targetColor = null) {
+function drawPixel(canvasObj, x, y, color, targetColor = null, username = "unknown") {
     const ctx = canvasObj.ctx;
     ctx.fillStyle = color;
     ctx.imageSmoothingEnabled = false;
 
-    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id, targetColor);
+    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id, targetColor, username);
 }
 
 /**
@@ -280,13 +282,13 @@ function drawPixel(canvasObj, x, y, color, targetColor = null) {
  * @param {string} color - Color to draw
  * @param {string} canvasId - ID of the canvas
  */
-function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null) {
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return;
-
+function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null, username = "unknown") {
     ctx.fillStyle = color;
     const radius = size / 2;
     const center = radius - 0.5;
+	// get canvas
+	const canvasObj = canvases.get(canvasId);
+	if (!canvasObj) return;
 
     for (let yOffset = 0; yOffset < size; yOffset++) {
         for (let xOffset = 0; xOffset < size; xOffset++) {
@@ -295,10 +297,19 @@ function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null) {
 
 				if (targetColor == null) {
                 	ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+					// set pixel data
+					const key = `${x + xOffset - radius + 1},${y + yOffset - radius + 1}`;
+					const pixelData = { color, user: username, timestamp: Date.now() };
+					canvasObj.canvasData[key] = pixelData;
 				} else {
 					// only draw if the pixel is the target color
-					if (getPixelColor(canvasId, x + xOffset - radius + 1, y + yOffset - radius + 1) == targetColor) {
+					if (getPixelColor(ctx, x + xOffset - radius + 1, y + yOffset - radius + 1) == targetColor) {
 						ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+						// set pixel data
+						const key = `${x + xOffset - radius + 1},${y + yOffset - radius + 1}`;
+						const pixelData = { color, user: username, timestamp: Date.now() };
+						canvasObj.canvasData[key] = pixelData;
+						
 					}
 				}
             }
@@ -306,19 +317,11 @@ function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null) {
     }
 }
 
-/**
- * Retrieves the color of a specific pixel.
- * @param {string} canvasId - ID of the canvas
- * @param {number} x - X-coordinate
- * @param {number} y - Y-coordinate
- * @returns {string} - Hex color string
- */
-function getPixelColor(canvasId, x, y) {
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return '#FFFFFF';
+function getPixelColor(ctx, x, y) {
+    if (!ctx) return '#FFFFFF';
 
     try {
-        const pixelData = canvasObj.ctx.getImageData(x, y, 1, 1).data;
+        const pixelData = ctx.getImageData(x, y, 1, 1).data;
         return `#${((1 << 24) + (pixelData[0] << 16) + (pixelData[1] << 8) + pixelData[2]).toString(16).slice(1)}`;
     } catch (error) {
         console.error('Error getting pixel color:', error);
@@ -740,17 +743,30 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
     socket.emit('join-canvas', { canvasId });
 
     // Initialize canvas data from server
-    socket.on('init-canvas', (data) => {
+    socket.on('init-canvas', async (data) => {
         if (data.canvasId === canvasId) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             const canvasData = data.canvasData || {};
-            Object.keys(canvasData).forEach(key => {
+            /*Object.keys(canvasData).forEach(key => {
                 const [px, py] = key.split(',').map(Number);
                 ctx.fillStyle = canvasData[key].color;
                 ctx.fillRect(px, py, 1, 1);
             });
+			*/
+
+			console.log(data.imageBlob);
+
+			const imageBlob = data.imageBlob;
+			
+			const image = new Image();
+			image.onload = () => {
+				console.log("Image loaded");
+				ctx.drawImage(image, 0, 0);
+			};
+			image.src = URL.createObjectURL(new Blob([imageBlob]));
+			
             canvasObj.canvasData = canvasData;
             loadingIndicator.style.display = 'none';
             updateArrowsVisibility(x, y);
@@ -1053,7 +1069,7 @@ window.onload = () => {
     // Request initial canvas list from server
     socket.emit('request-canvas-list');
 
-    socket.on('update-canvas-list', ({ canvasList }) => {
+    socket.on('update-canvas-list', async ({ canvasList }) => {
         canvasList.forEach(canvasId => {
             const [x, y] = canvasId.split('|').map(Number);
             createCanvasWrapper(x, y);
@@ -1067,7 +1083,7 @@ window.onload = () => {
     });
 
     // Handle incoming draw-pixel events
-    socket.on('draw', (data) => {
+    socket.on('draw', async (data) => {
         const { canvasId, x, y, color, size, tool, extra_data, user, timestamp } = data;
         const canvasObj = canvases.get(canvasId);
         if (!canvasObj) return;
@@ -1076,7 +1092,7 @@ window.onload = () => {
         canvasObj.ctx.imageSmoothingEnabled = false;
 
         
-        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId, extra_data.targetColor);
+        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId, extra_data.targetColor, user);
      
     });
 };
@@ -1087,11 +1103,3 @@ window.addEventListener('keydown', (e) => {
         e.preventDefault();
     }
 });
-
-// Initial Canvas Setup
-function initializeCanvases() {
-    // This function can be expanded if needed
-}
-
-// Start initialization
-initializeCanvases();

@@ -130,3 +130,5 @@ dist
 .pnp.*
 /data
 config.json
+/canvases
+temp.png
