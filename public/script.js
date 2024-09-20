@@ -1,54 +1,46 @@
 // script.js
 
-// ==================== Constants ====================
-const CANVAS_SIZE = 512; // Canvas dimensions (512x512)
-const GAP_SIZE = 10;     // Gap between canvases
-const ZOOM_SENSITIVITY = 0.1;
-const HOVER_DELAY = 200; // Tooltip hover delay in milliseconds
-
-const TOOL_TYPES = {
-    PENCIL: 'pencil',
-    ERASER: 'eraser',
-    COLOR_PICKER: 'color-picker'
-};
-
-const DIRECTIONS = ['up', 'down', 'left', 'right'];
-
-// ==================== State Variables ====================
+// Initialize Socket.IO
 const socket = io();
 
+// Constants
+const CANVAS_SIZE = 512; // 512x512 canvases
+const GAP_SIZE = 10; // Gap between canvases
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 20;
+const ZOOM_SENSITIVITY = 0.005;
+const PAN_SPEED = 2;
+
+// DOM Elements
 const canvasMap = document.getElementById('canvas-map');
 const loadingIndicator = document.getElementById('loading-indicator');
 const tooltip = document.getElementById('pixel-tooltip');
+const loginButton = document.getElementById('login-button');
+const logoutButton = document.getElementById('logout-button');
+const userInfoSpan = document.getElementById('user-info');
+const pencilSizeDisplay = document.getElementById('pencil-size-display');
+const pencilSizeSlider = document.getElementById('pencil-size-slider');
+const toolButtons = document.querySelectorAll('.tool-button');
+const colorSwatches = document.querySelectorAll('.color-swatch');
 
-let currentTool = TOOL_TYPES.PENCIL;
-let currentColor = '#FFB3BA';
+// State Variables
+let currentTool = 'pencil';
+let currentColor = '#FFB3BA'; // Default color
 let pencilSize = 6;
-
 let isAuthenticated = false;
 let userInfo = null;
-
-const canvases = new Map(); // Map<canvasId, CanvasObject>
-
+let isDrawing = false;
+let currentCanvasObj = null;
 let isPanning = false;
 let startPan = { x: 0, y: 0 };
 let currentPan = { x: 0, y: 0 };
 let currentZoom = 1;
-const MIN_ZOOM = 0.2;
-const MAX_ZOOM = 20;
-
-let isDrawing = false;
-let currentCanvasObj = null;
-
-let disableDrawing = false;
-
 let hoverTimeout = null;
 let lastHoveredPixel = null;
+let disableDrawing = false;
+const canvases = new Map(); // key: 'x|y', value: { canvas, ctx, canvasData, rendered }
 
-const keysPressed = {};
-const panSpeed = 2;
-
-// ==================== Tool Classes ====================
+// Tool Classes
 
 // Base Tool Class
 class Tool {
@@ -56,30 +48,34 @@ class Tool {
         this.name = name;
     }
 
-    onMouseDown(event, canvasObj) {}
-    onMouseMove(event, canvasObj) {}
-    onMouseUp(event, canvasObj) {}
+    onMouseDown(e, canvasObj) {}
+    onMouseMove(e, canvasObj) {}
+    onMouseUp(e, canvasObj) {}
 }
 
-// Pencil and Eraser Tools share similar behavior
+// Drawing Tool (Handles Pencil and Eraser)
 class DrawingTool extends Tool {
-    constructor(name) {
+    constructor(name, isEraser = false) {
         super(name);
+        this.isEraser = isEraser;
         this.lastPosition = null;
     }
 
-    onMouseDown(event, canvasObj) {
+	
+
+    onMouseDown(e, canvasObj) {
         if (!isAuthenticated) return;
         isDrawing = true;
         currentCanvasObj = canvasObj;
-        const { x, y } = getCanvasCoordinates(event, canvasObj);
+        const { x, y } = getCanvasCoordinates(e, canvasObj);
         this.lastPosition = { x, y };
-        this.plotPoint(canvasObj, x, y);
+        const drawColor = this.isEraser ? '#FFFFFF' : currentColor;
+        this.plotPoint(canvasObj, x, y, drawColor);
     }
 
-    onMouseMove(event, canvasObj) {
-        if (isDrawing && currentCanvasObj === canvasObj) {
-            this.draw(event, canvasObj);
+    onMouseMove(e, canvasObj) {
+        if (isDrawing && currentCanvasObj) {
+            this.draw(e, currentCanvasObj);
         }
     }
 
@@ -89,151 +85,145 @@ class DrawingTool extends Tool {
         this.lastPosition = null;
     }
 
-    draw(event, canvasObj) {
-        const { x, y } = getCanvasCoordinates(event, canvasObj);
-        const color = this.name === TOOL_TYPES.ERASER ? '#FFFFFF' : currentColor;
+    draw(e, canvasObj) {
+        const { x, y } = getCanvasCoordinates(e, canvasObj);
+        const drawColor = this.isEraser ? '#FFFFFF' : currentColor;
 
         if (this.lastPosition && (this.lastPosition.x !== x || this.lastPosition.y !== y)) {
-            this.interpolateLine(canvasObj, this.lastPosition.x, this.lastPosition.y, x, y, color);
+            this.interpolateLine(canvasObj, this.lastPosition.x, this.lastPosition.y, x, y, drawColor);
         }
 
         this.lastPosition = { x, y };
     }
 
-    plotPoint(canvasObj, x, y) {
-        const color = this.name === TOOL_TYPES.ERASER ? '#FFFFFF' : currentColor;
+    plotPoint(canvasObj, x, y, drawColor) {
+        // Plot within current canvas
+        const adjustedColor = this.isEraser ? '#FFFFFF' : drawColor;
+        drawPixel(canvasObj, x, y, adjustedColor);
 
-        if (isOutOfBounds(x, y, canvasObj)) {
-            handleEdgeCrossing.call(this, x, y, canvasObj, color);
-            return;
-        }
-
-        const ctx = canvasObj.ctx;
-        ctx.fillStyle = color;
-        ctx.imageSmoothingEnabled = false;
-
-        if (pencilSize >= 3) {
-            drawCircle(ctx, x, y, pencilSize / 2, { color, user: userInfo, timestamp: Date.now() }, canvasObj.id);
-        } else if (pencilSize === 2) {
-            drawPlusShape(ctx, x, y, { color, user: userInfo, timestamp: Date.now() }, canvasObj.id);
-        } else {
-            ctx.fillRect(x, y, 1, 1);
-            updateCanvasData(canvasObj, x, y, { color, user: userInfo, timestamp: Date.now() });
-        }
-
-        socket.emit('draw-pixel', {
+        // Emit draw event
+        socket.emit('draw', {
             canvasId: canvasObj.id,
             x,
             y,
-            color,
+            color: adjustedColor,
             size: pencilSize,
-            tool: this.name
+            tool: this.name,
+            user: userInfo,
+            timestamp: Date.now()
         });
     }
 
-    interpolateLine(canvasObj, x1, y1, x2, y2, color) {
+    interpolateLine(canvasObj, x1, y1, x2, y2, drawColor) {
         const distance = Math.hypot(x2 - x1, y2 - y1);
         const steps = Math.ceil(distance);
 
         for (let i = 0; i <= steps; i++) {
             const t = i / steps;
-            const interpolatedX = Math.round(x1 + t * (x2 - x1));
-            const interpolatedY = Math.round(y1 + t * (y2 - y1));
+            let interpolatedX = Math.round(x1 + t * (x2 - x1));
+            let interpolatedY = Math.round(y1 + t * (y2 - y1));
 
-            if (isOutOfBounds(interpolatedX, interpolatedY, canvasObj)) {
-                this.handleEdgeCrossing(interpolatedX, interpolatedY, canvasObj, color);
-                break;
-            }
-
-            this.plotPoint(canvasObj, interpolatedX, interpolatedY);
+			this.plotPoint(canvasObj, interpolatedX, interpolatedY, drawColor);
         }
-    }
-}
-
-// Pencil Tool
-class PencilTool extends DrawingTool {
-    constructor() {
-        super(TOOL_TYPES.PENCIL);
-    }
-}
-
-// Eraser Tool
-class EraserTool extends DrawingTool {
-    constructor() {
-        super(TOOL_TYPES.ERASER);
     }
 }
 
 // Color Picker Tool
 class ColorPickerTool extends Tool {
-    constructor() {
-        super(TOOL_TYPES.COLOR_PICKER);
+    constructor(name) {
+        super(name);
     }
 
-    onMouseDown(event, canvasObj) {
-        const { x, y } = getCanvasCoordinates(event, canvasObj);
+    onMouseDown(e, canvasObj) {
+        const { x, y } = getCanvasCoordinates(e, canvasObj);
         const color = getPixelColor(canvasObj.id, x, y);
         currentColor = color;
         updateColorSwatches(color);
     }
 }
 
-// ==================== Tool Initialization ====================
+// Initialize Tools
 const tools = {
-    [TOOL_TYPES.PENCIL]: new PencilTool(),
-    [TOOL_TYPES.ERASER]: new EraserTool(),
-    [TOOL_TYPES.COLOR_PICKER]: new ColorPickerTool()
+    'pencil': new DrawingTool('pencil'),
+    'eraser': new DrawingTool('eraser', true),
+    'color-picker': new ColorPickerTool('color-picker')
 };
 
 // Set default tool
+currentTool = 'pencil';
 document.getElementById('pencil-tool').classList.add('selected');
 
-// ==================== Utility Functions ====================
+// Utility Functions
 
-// Check if coordinates are out of canvas bounds
-function isOutOfBounds(x, y, canvasObj) {
-    return x < 0 || x >= canvasObj.canvas.width || y < 0 || y >= canvasObj.canvas.height;
-}
+/**
+ * Translates mouse or touch event to canvas coordinates.
+ * @param {MouseEvent | TouchEvent} e - The event object.
+ * @param {object} canvasObj - The canvas object.
+ * @returns {object} - An object containing x and y coordinates.
+ */
+function getCanvasCoordinates(e, canvasObj) {
+    const rect = canvasObj.canvas.getBoundingClientRect();
+    const scaleX = canvasObj.canvas.width / rect.width;
+    const scaleY = canvasObj.canvas.height / rect.height;
 
-// Handle edge crossing for drawing tools
-function handleEdgeCrossing(x, y, canvasObj, color) {
-    let adjX = x;
-    let adjY = y;
-
-    if (x < 0) adjX = canvasObj.canvas.width - 1;
-    else if (x >= canvasObj.canvas.width) adjX = 0;
-
-    if (y < 0) adjY = canvasObj.canvas.height - 1;
-    else if (y >= canvasObj.canvas.height) adjY = 0;
-
-    const direction = getDirectionFromEdge(x, y, canvasObj);
-    const neighborId = getNeighborCanvasId(canvasObj.id, direction);
-    const adjCanvasObj = canvases.get(neighborId);
-
-    if (adjCanvasObj) {
-        this.plotPoint(adjCanvasObj, adjX, adjY);
-        currentCanvasObj = adjCanvasObj;
-        this.lastPosition = { x: adjX, y: adjY };
+    if (e.touches && e.touches.length > 0) {
+        const x = Math.floor((e.touches[0].clientX - rect.left) * scaleX);
+        const y = Math.floor((e.touches[0].clientY - rect.top) * scaleY);
+        return { x, y };
+    } else {
+        const x = Math.floor((e.clientX - rect.left) * scaleX);
+        const y = Math.floor((e.clientY - rect.top) * scaleY);
+        return { x, y };
     }
 }
 
-// Get direction based on edge crossing
+/**
+ * Checks if the coordinates are within the canvas boundaries.
+ * @param {number} x - X-coordinate
+ * @param {number} y - Y-coordinate
+ * @param {object} canvasObj - Canvas object
+ * @returns {boolean}
+ */
+function isWithinCanvas(x, y, canvasObj) {
+    return x >= 0 && x < canvasObj.canvas.width && y >= 0 && y < canvasObj.canvas.height;
+}
+
+/**
+ * Wraps the coordinate if it goes beyond canvas boundaries.
+ * @param {number} coord - Coordinate value
+ * @param {number} max - Maximum value (width or height)
+ * @returns {number}
+ */
+function wrapCoordinate(coord, max) {
+    if (coord < 0) return max - 1;
+    if (coord >= max) return 0;
+    return coord;
+}
+
+/**
+ * Determines the direction based on edge crossing.
+ * @param {number} x - X-coordinate
+ * @param {number} y - Y-coordinate
+ * @param {object} canvasObj - Canvas object
+ * @returns {string|null}
+ */
 function getDirectionFromEdge(x, y, canvasObj) {
     if (x < 0) return 'left';
     if (x >= canvasObj.canvas.width) return 'right';
     if (y < 0) return 'down';
     if (y >= canvasObj.canvas.height) return 'up';
+    return null;
 }
 
-// Generate unique canvas ID
-function generateCanvasId(x, y) {
-    return `${x}|${y}`;
-}
-
-// Get neighboring canvas ID based on direction
+/**
+ * Gets the neighbor canvas ID based on direction.
+ * @param {string} currentId - Current canvas ID
+ * @param {string} direction - Direction of the neighbor
+ * @returns {string|null}
+ */
 function getNeighborCanvasId(currentId, direction) {
     const [x, y] = currentId.split('|').map(Number);
-    switch (direction) {
+    switch(direction) {
         case 'left': return `${x - 1}|${y}`;
         case 'right': return `${x + 1}|${y}`;
         case 'up': return `${x}|${y + 1}`;
@@ -242,55 +232,55 @@ function getNeighborCanvasId(currentId, direction) {
     }
 }
 
-// Update canvas data with pixel information
-function updateCanvasData(canvasObj, x, y, pixelInfo) {
-    if (!canvasObj.canvasData) {
-        canvasObj.canvasData = {};
-    }
-    canvasObj.canvasData[`${x},${y}`] = pixelInfo;
+/**
+ * Draws a pixel or a brush based on the current brush size.
+ * @param {object} canvasObj - Canvas object
+ * @param {number} x - X-coordinate
+ * @param {number} y - Y-coordinate
+ * @param {string} color - Color to draw
+ */
+function drawPixel(canvasObj, x, y, color) {
+    const ctx = canvasObj.ctx;
+    ctx.fillStyle = color;
+    ctx.imageSmoothingEnabled = false;
+
+    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id);
 }
 
-// Draw a pixelated circle
-function drawCircle(ctx, x, y, radius, pixelInfo, canvasId) {
+/**
+ * Draws a circular brush with configurable pixel size.
+ * @param {CanvasRenderingContext2D} ctx - Canvas context
+ * @param {number} x - X-coordinate
+ * @param {number} y - Y-coordinate
+ * @param {number} size - Radius of the brush
+ * @param {string} color - Color to draw
+ * @param {string} canvasId - ID of the canvas
+ */
+function drawBrush(ctx, x, y, size, color, canvasId) {
     const canvasObj = canvases.get(canvasId);
     if (!canvasObj) return;
-    radius = Math.floor(radius);
-    for (let dx = -radius; dx <= radius; dx++) {
-        for (let dy = -radius; dy <= radius; dy++) {
-            if ((dx * dx + dy * dy) <= (radius * radius - radius * 0.8)) {
-                ctx.fillRect(x + dx, y + dy, 1, 1);
-                updateCanvasData(canvasObj, x + dx, y + dy, pixelInfo);
+
+    ctx.fillStyle = color;
+    const radius = size / 2;
+    const center = radius - 0.5;
+
+    for (let yOffset = 0; yOffset < size; yOffset++) {
+        for (let xOffset = 0; xOffset < size; xOffset++) {
+            const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
+            if (distance < radius) {
+                ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
             }
         }
     }
 }
 
-// Draw a plus shape for pencil size 2
-function drawPlusShape(ctx, x, y, pixelInfo, canvasId) {
-    ctx.fillRect(x, y - 1, 1, 3); // Vertical line
-    ctx.fillRect(x - 1, y, 3, 1); // Horizontal line
-
-    const pixels = [
-        `${x},${y - 1}`,
-        `${x},${y}`,
-        `${x - 1},${y}`,
-        `${x + 1},${y}`,
-        `${x},${y + 1}`
-    ];
-
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return;
-
-    if (!canvasObj.canvasData) {
-        canvasObj.canvasData = {};
-    }
-
-    pixels.forEach(key => {
-        canvasObj.canvasData[key] = pixelInfo;
-    });
-}
-
-// Get pixel color from a specific canvas
+/**
+ * Retrieves the color of a specific pixel.
+ * @param {string} canvasId - ID of the canvas
+ * @param {number} x - X-coordinate
+ * @param {number} y - Y-coordinate
+ * @returns {string} - Hex color string
+ */
 function getPixelColor(canvasId, x, y) {
     const canvasObj = canvases.get(canvasId);
     if (!canvasObj) return '#FFFFFF';
@@ -304,53 +294,383 @@ function getPixelColor(canvasId, x, y) {
     }
 }
 
-// Update color swatches to reflect the selected color
-function updateColorSwatches(selectedColor) {
-    document.querySelectorAll('.color-swatch').forEach(swatch => {
-        swatch.classList.toggle('selected', swatch.getAttribute('data-color').toLowerCase() === selectedColor.toLowerCase());
+/**
+ * Updates the selected color swatch.
+ * @param {string} color - Selected color
+ */
+function updateColorSwatches(color) {
+    colorSwatches.forEach(swatch => {
+        swatch.classList.toggle('selected', swatch.getAttribute('data-color').toLowerCase() === color.toLowerCase());
     });
 }
 
-// Show tooltip with pixel information
-function showPixelInfo(event, info) {
+// Event Handlers
+
+/**
+ * Handles global mouse down events for drawing.
+ * @param {MouseEvent} e 
+ */
+function handleMouseDown(e) {
+    if (disableDrawing || e.button !== 0) return; // Only left-click
+
+	if(e.target.closest == undefined) return;
+
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper) return;
+
+    const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+    const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+    const canvasId = `${x}|${y}`;
+    const canvasObj = canvases.get(canvasId);
+    if (canvasObj) {
+        const tool = tools[currentTool];
+        tool?.onMouseDown(e, canvasObj);
+    }
+}
+
+/**
+* Handles global touch start events for drawing.
+* @param {TouchEvent} e 
+*/
+function handleTouchStart(e) {
+	if (disableDrawing) return;
+	const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+	if (!targetCanvasWrapper) return;
+
+	const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+	const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+	const canvasId = `${x}|${y}`;
+	const canvasObj = canvases.get(canvasId);
+	if (canvasObj) {
+		const tool = tools[currentTool];
+		tool?.onMouseDown(e, canvasObj);
+	}
+}
+
+/**
+ * Handles global mouse move events for drawing.
+ * @param {MouseEvent} e 
+ */
+function handleMouseMove(e) {
+    if (!isDrawing) return;
+
+	// make sure e.target.closest is defined
+	if(e.target.closest == undefined) return
+
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper || !currentCanvasObj) return;
+
+    const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+    const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+    const canvasId = `${x}|${y}`;
+    const canvasObj = canvases.get(canvasId);
+    if (canvasObj) {
+
+		// if canvasObj is not the same as currentCanvasObj, do onMouseUp on currentCanvasObj and onMouseDown on canvasObj
+		if (canvasObj !== currentCanvasObj) {
+			console.log("Mouse up on currentCanvasObj and mouse down on canvasObj");
+			const tool = tools[currentTool];
+			tool?.onMouseUp(e, currentCanvasObj);
+			tool?.onMouseDown(e, canvasObj);
+			currentCanvasObj = canvasObj;	
+		}
+
+
+        const tool = tools[currentTool];
+        tool?.onMouseMove(e, canvasObj);
+    }
+}
+
+/**
+* Handles global touch move events for drawing.
+* @param {TouchEvent} e 
+*/
+function handleTouchMove(e) {
+	if (!isDrawing) return;
+	const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+	if (!targetCanvasWrapper || !currentCanvasObj) return;
+
+	const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+	const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+	const canvasId = `${x}|${y}`;
+	const canvasObj = canvases.get(canvasId);
+	if (canvasObj) {
+		const tool = tools[currentTool];
+		tool?.onMouseMove(e, canvasObj);
+	}
+}
+
+/**
+ * Handles global mouse up events for drawing.
+ * @param {MouseEvent} e 
+ */
+function handleMouseUp(e) {
+    if (!isDrawing) return;
+	if(e.target.closest == undefined) return
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper || !currentCanvasObj) return;
+
+    const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+    const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+    const canvasId = `${x}|${y}`;
+    const canvasObj = canvases.get(canvasId);
+    if (canvasObj) {
+        const tool = tools[currentTool];
+        tool?.onMouseUp(e, canvasObj);
+    }
+}
+
+/**
+* Handles global touch end events for drawing.
+* @param {TouchEvent} e
+*/
+function handleTouchEnd(e) {
+	if (!isDrawing) return;
+	const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+	if (!targetCanvasWrapper || !currentCanvasObj) return;
+
+	const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+	const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+	const canvasId = `${x}|${y}`;
+	const canvasObj = canvases.get(canvasId);
+	if (canvasObj) {
+		const tool = tools[currentTool];
+		tool?.onMouseUp(e, canvasObj);
+	}
+}
+
+// Global Event Listeners for Drawing
+document.addEventListener('mousedown', handleMouseDown);
+document.addEventListener('mousemove', handleMouseMove);
+document.addEventListener('mouseup', handleMouseUp);
+// touch events
+document.addEventListener('touchstart', handleTouchStart);
+document.addEventListener('touchmove', handleTouchMove);
+document.addEventListener('touchend', handleTouchEnd);
+
+
+// Tooltip Handling
+canvasMap.addEventListener('mousemove', (e) => {
+    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
+    if (!targetCanvasWrapper) {
+        hidePixelInfo();
+        clearTimeout(hoverTimeout);
+        lastHoveredPixel = null;
+        return;
+    }
+
+    const x = Number(targetCanvasWrapper.getAttribute('data-x'));
+    const y = Number(targetCanvasWrapper.getAttribute('data-y'));
+    const canvasId = `${x}|${y}`;
+    const canvasObj = canvases.get(canvasId);
+    if (!canvasObj) {
+        hidePixelInfo();
+        clearTimeout(hoverTimeout);
+        lastHoveredPixel = null;
+        return;
+    }
+
+    const { x: pixelX, y: pixelY } = getCanvasCoordinates(e, canvasObj);
+    const key = `${pixelX},${pixelY}`;
+    const pixelData = canvasObj.canvasData?.[key] || null;
+
+    const currentHoveredPixel = { canvasId, x: pixelX, y: pixelY };
+    if (lastHoveredPixel && 
+        lastHoveredPixel.canvasId === canvasId && 
+        lastHoveredPixel.x === pixelX && 
+        lastHoveredPixel.y === pixelY) {
+        return; // Same pixel, do nothing
+    }
+
+    clearTimeout(hoverTimeout);
+    lastHoveredPixel = currentHoveredPixel;
+
+    if (pixelData && pixelData.user) {
+        showPixelInfo(e, pixelData);
+    } else {
+        hidePixelInfo();
+    }
+});
+
+/**
+ * Displays pixel information tooltip.
+ * @param {MouseEvent} e 
+ * @param {object} info 
+ */
+function showPixelInfo(e, info) {
     tooltip.innerHTML = `
         <strong>Placed by:</strong> ${info.user.username}<br>
         <strong>At:</strong> ${new Date(info.timestamp).toLocaleString()}
     `;
-    tooltip.style.left = `${event.pageX + GAP_SIZE}px`;
-    tooltip.style.top = `${event.pageY + GAP_SIZE}px`;
+    tooltip.style.left = `${e.pageX + GAP_SIZE}px`;
+    tooltip.style.top = `${e.pageY + GAP_SIZE}px`;
     tooltip.style.display = 'block';
 }
 
-// Hide the tooltip
+/**
+ * Hides the pixel information tooltip.
+ */
 function hidePixelInfo() {
     tooltip.style.display = 'none';
     clearTimeout(hoverTimeout);
 }
 
-// Position canvas based on its coordinates
+// Authentication and User Info Handling
+
+/**
+ * Updates the login/logout UI based on authentication status.
+ */
+function updateLoginStatusUI() {
+    if (isAuthenticated) {
+        loginButton.style.display = 'none';
+        logoutButton.style.display = 'flex';
+        logoutButton.style.alignItems = 'center';
+        logoutButton.style.justifyContent = 'center';
+        userInfoSpan.innerHTML = `<i class="fas fa-user-circle"></i>&nbsp;Logged in as&nbsp;<strong>${userInfo.username}</strong>`;
+    } else {
+        loginButton.style.display = 'flex';
+        loginButton.style.alignItems = 'center';
+        loginButton.style.justifyContent = 'center';
+        logoutButton.style.display = 'none';
+        userInfoSpan.innerHTML = '';
+    }
+}
+
+/**
+ * Fetches the authentication status from the server.
+ */
+function fetchAuthStatus() {
+    fetch('/auth/status')
+        .then(response => response.json())
+        .then(data => {
+            isAuthenticated = data.isAuthenticated;
+            userInfo = data.user;
+            updateLoginStatusUI();
+            if (!isAuthenticated) {
+                alert('You must be logged in with Discord to draw on the canvas.');
+            }
+        })
+        .catch(err => console.error('Error fetching auth status:', err));
+}
+
+// Tool Selection Event Listeners
+toolButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        toolButtons.forEach(btn => btn.classList.remove('selected'));
+        button.classList.add('selected');
+        currentTool = button.id.replace('-tool', '');
+    });
+});
+
+// Color Selection Event Listeners
+colorSwatches.forEach(swatch => {
+    swatch.addEventListener('click', (e) => {
+        colorSwatches.forEach(s => s.classList.remove('selected'));
+        e.target.classList.add('selected');
+        currentColor = e.target.getAttribute('data-color');
+    });
+});
+
+/**
+ * Updates the color swatches to reflect the selected color.
+ * @param {string} color 
+ */
+function updateColorSwatches(color) {
+    colorSwatches.forEach(swatch => {
+        swatch.classList.toggle('selected', swatch.getAttribute('data-color').toLowerCase() === color.toLowerCase());
+    });
+}
+
+// Pencil Size Slider Event Listener
+pencilSizeSlider.addEventListener('input', (e) => {
+    pencilSize = parseInt(e.target.value, 10);
+    pencilSizeDisplay.textContent = pencilSize;
+});
+
+// Canvas Visibility and Management
+
+/**
+ * Checks if a canvas is visible within the current viewport.
+ * @param {number} x 
+ * @param {number} y 
+ * @returns {boolean}
+ */
+function isCanvasVisible(x, y) {
+    const canvasSize = CANVAS_SIZE;
+    const gap = GAP_SIZE;
+    const panX = currentPan.x;
+    const panY = currentPan.y;
+    const zoom = currentZoom;
+
+    let canvasX = x * (canvasSize + gap) * zoom + panX;
+    let canvasY = -y * (canvasSize + gap) * zoom + panY;
+
+    const viewportWidth = window.innerWidth;
+    const viewportHeight = window.innerHeight;
+    const viewportWidthHalf = viewportWidth / 2;
+    const viewportHeightHalf = viewportHeight / 2;
+
+    canvasX += viewportWidthHalf;
+    canvasY += viewportHeightHalf;
+
+    let canvasWidth = canvasSize * zoom;
+    let canvasHeight = canvasSize * zoom;
+
+    return !(canvasX + canvasWidth < 0 || canvasX > viewportWidth || canvasY + canvasHeight < 0 || canvasY > viewportHeight);
+}
+
+/**
+ * Updates the visibility of canvases based on their position.
+ */
+function updateVisibleCanvases() {
+    canvases.forEach((canvasObj, canvasId) => {
+        const [x, y] = canvasId.split('|').map(Number);
+        const wrapper = document.querySelector(`.canvas-wrapper[data-x="${x}"][data-y="${y}"]`);
+
+        if (isCanvasVisible(x, y)) {
+            if (!canvasObj.rendered) {
+                wrapper.style.display = 'block';
+                socket.emit('join-canvas', { canvasId });
+                canvasObj.rendered = true;
+            }
+        } else {
+            if (canvasObj.rendered) {
+                wrapper.style.display = 'none';
+                socket.emit('leave-canvas', { canvasId });
+                canvasObj.rendered = false;
+            }
+        }
+    });
+}
+
+/**
+ * Positions a canvas wrapper based on its coordinates.
+ * @param {HTMLElement} wrapper 
+ * @param {number} x 
+ * @param {number} y 
+ */
 function positionCanvas(wrapper, x, y) {
     wrapper.style.left = `${x * (CANVAS_SIZE + GAP_SIZE)}px`;
     wrapper.style.top = `${-y * (CANVAS_SIZE + GAP_SIZE)}px`;
 }
 
-// Update the CSS transform for panning and zooming
-function updateCanvasMapTransform() {
-    canvasMap.style.transform = `translate(${currentPan.x}px, ${currentPan.y}px) scale(${currentZoom})`;
-    updateVisibleCanvases();
-}
-
-// ==================== Canvas Management ====================
-
-// Create a new canvas wrapper at (x, y)
+/**
+ * Creates a new canvas wrapper at specified coordinates.
+ * @param {number} x 
+ * @param {number} y 
+ * @param {boolean} alreadyLoaded 
+ */
 function createCanvasWrapper(x, y, alreadyLoaded = false) {
     const canvasId = generateCanvasId(x, y);
-    if (canvases.has(canvasId) && !alreadyLoaded) return;
+
+    if (canvases.has(canvasId) && !alreadyLoaded) {
+        return;
+    }
 
     const wrapper = document.createElement('div');
     wrapper.classList.add('canvas-wrapper');
-    wrapper.dataset.x = x;
-    wrapper.dataset.y = y;
+    wrapper.setAttribute('data-x', x);
+    wrapper.setAttribute('data-y', y);
     positionCanvas(wrapper, x, y);
 
     const canvas = document.createElement('canvas');
@@ -359,8 +679,8 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
     canvas.height = CANVAS_SIZE;
     wrapper.appendChild(canvas);
 
-    // Add directional arrows
-    DIRECTIONS.forEach(direction => {
+    // Add arrow buttons for adding neighboring canvases
+    ['up', 'down', 'left', 'right'].forEach(direction => {
         const arrow = document.createElement('button');
         arrow.classList.add('arrow', direction);
         arrow.title = `Add Canvas ${capitalize(direction)}`;
@@ -380,43 +700,45 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
         y,
         canvas,
         ctx,
-        drawing: false,
-        rendered: true,
-        canvasData: {}
+        canvasData: {},
+        rendered: true
     };
 
     canvases.set(canvasId, canvasObj);
     socket.emit('join-canvas', { canvasId });
 
-    // Initialize canvas with data from the server
+    // Initialize canvas data from server
     socket.on('init-canvas', (data) => {
         if (data.canvasId === canvasId) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-            const { canvasData } = data;
-            Object.entries(canvasData).forEach(([key, value]) => {
+            const canvasData = data.canvasData || {};
+            Object.keys(canvasData).forEach(key => {
                 const [px, py] = key.split(',').map(Number);
-                ctx.fillStyle = value.color;
+                ctx.fillStyle = canvasData[key].color;
                 ctx.fillRect(px, py, 1, 1);
             });
-            canvasObj.canvasData = { ...canvasData };
+            canvasObj.canvasData = canvasData;
             loadingIndicator.style.display = 'none';
             updateArrowsVisibility(x, y);
         }
     });
-
-    addCanvasEventListeners(canvas, canvasObj);
 }
 
-// Handle directional arrow clicks to add new canvases
+/**
+ * Handles arrow button clicks to add neighboring canvases.
+ * @param {number} currentX 
+ * @param {number} currentY 
+ * @param {string} direction 
+ */
 function handleArrowClick(currentX, currentY, direction) {
     if (!isAuthenticated) return;
 
     let newX = currentX;
     let newY = currentY;
 
-    switch (direction) {
+    switch(direction) {
         case 'up': newY += 1; break;
         case 'down': newY -= 1; break;
         case 'left': newX -= 1; break;
@@ -434,516 +756,179 @@ function handleArrowClick(currentX, currentY, direction) {
     createCanvasWrapper(newX, newY);
 }
 
-// Update the visibility of directional arrows based on existing canvases
-function updateArrowsVisibility(x, y) {
-    DIRECTIONS.forEach(direction => {
-        const neighborId = getNeighborCanvasId(generateCanvasId(x, y), direction);
-        const wrapper = document.querySelector(`.canvas-wrapper[data-x="${x}"][data-y="${y}"]`);
-        if (wrapper) {
-            const arrow = wrapper.querySelector(`.arrow.${direction}`);
-            arrow.style.display = canvases.has(neighborId) ? 'none' : 'block';
-        }
-
-        // Also update neighboring canvases' arrows
-        const [nx, ny] = neighborId ? neighborId.split('|').map(Number) : [null, null];
-        if (neighborId && canvases.has(neighborId)) {
-            const neighborWrapper = document.querySelector(`.canvas-wrapper[data-x="${nx}"][data-y="${ny}"]`);
-            if (neighborWrapper) {
-                const oppositeDirection = getOppositeDirection(direction);
-                const neighborArrow = neighborWrapper.querySelector(`.arrow.${oppositeDirection}`);
-                if (neighborArrow) {
-                    neighborArrow.style.display = 'none';
-                }
-            }
-        }
-    });
-}
-
-// Get opposite direction for arrow visibility updates
-function getOppositeDirection(direction) {
-    switch (direction) {
-        case 'up': return 'down';
-        case 'down': return 'up';
-        case 'left': return 'right';
-        case 'right': return 'left';
-        default: return null;
-    }
-}
-
-// Capitalize the first letter of a string
+/**
+ * Capitalizes the first letter of a string.
+ * @param {string} str 
+ * @returns {string}
+ */
 function capitalize(str) {
     return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
-// ==================== Event Listeners ====================
-
-// Add event listeners to a canvas for mouse and touch interactions
-function addCanvasEventListeners(canvas, canvasObj) {
-    canvas.addEventListener('mousedown', (e) => handleCanvasEvent(e, 'onMouseDown', canvasObj));
-    canvas.addEventListener('mousemove', (e) => handleCanvasEvent(e, 'onMouseMove', canvasObj));
-    canvas.addEventListener('mouseup', (e) => handleCanvasEvent(e, 'onMouseUp', canvasObj));
-    canvas.addEventListener('mouseleave', (e) => handleCanvasEvent(e, 'onMouseUp', canvasObj));
-
-    // Touch events for mobile support
-    ['touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(eventType => {
-        canvas.addEventListener(eventType, (e) => handleCanvasEvent(e, `on${capitalize(eventType.split('touch')[1])}`, canvasObj));
-    });
+/**
+ * Generates a canvas ID based on coordinates.
+ * @param {number} x 
+ * @param {number} y 
+ * @returns {string}
+ */
+function generateCanvasId(x, y) {
+    return `${x}|${y}`;
 }
 
-// Handle canvas-specific events
-function handleCanvasEvent(event, handlerName, canvasObj) {
-    if (disableDrawing) return;
-
-    const tool = tools[currentTool];
-    if (tool && typeof tool[handlerName] === 'function') {
-        tool[handlerName](event, canvasObj);
-    }
-}
-
-// Global Mouse Event Listeners for Drawing Across Canvases
-document.addEventListener('mousedown', (e) => {
-    if (disableDrawing || e.button !== 0) return;
-    handleGlobalMouseEvent(e, 'onMouseDown');
-});
-
-document.addEventListener('mousemove', (e) => {
-    if (!isDrawing) return;
-    handleGlobalMouseEvent(e, 'onMouseMove');
-});
-
-document.addEventListener('mouseup', (e) => {
-    if (!isDrawing) return;
-    handleGlobalMouseEvent(e, 'onMouseUp');
-    isDrawing = false;
-    currentCanvasObj = null;
-});
-
-// Handle `mouseenter` to simulate drawing when dragging across canvases
-document.addEventListener('mouseenter', (e) => {
-    if (e.buttons === 1) {
-        handleGlobalMouseEvent(e, 'onMouseDown');
-    }
-}, true);
-
-// Handle global mouse events
-function handleGlobalMouseEvent(event, handlerName) {
-    const targetCanvasWrapper = event.target.closest('.canvas-wrapper');
-    if (!targetCanvasWrapper) return;
-
-    const canvasId = generateCanvasId(
-        Number(targetCanvasWrapper.dataset.x),
-        Number(targetCanvasWrapper.dataset.y)
-    );
-    const canvasObj = canvases.get(canvasId);
-    if (canvasObj && tools[currentTool][handlerName]) {
-        tools[currentTool][handlerName](event, canvasObj);
-    }
-}
-
-// ==================== Authentication Handling ====================
-
-// Update Login/Logout UI based on authentication status
-function updateLoginStatusUI() {
-    const loginButton = document.getElementById('login-button');
-    const logoutButton = document.getElementById('logout-button');
-    const userInfoSpan = document.getElementById('user-info');
-
-    if (isAuthenticated) {
-        loginButton.style.display = 'none';
-        logoutButton.style.display = 'flex';
-        logoutButton.style.alignItems = 'center';
-        logoutButton.style.justifyContent = 'center';
-        userInfoSpan.innerHTML = `<i class="fas fa-user-circle"></i>&nbsp;Logged in as&nbsp;<strong>${userInfo.username}</strong>`;
-    } else {
-        loginButton.style.display = 'flex';
-        loginButton.style.alignItems = 'center';
-        loginButton.style.justifyContent = 'center';
-        logoutButton.style.display = 'none';
-        userInfoSpan.innerHTML = '';
-    }
-}
-
-// Fetch authentication status from the server
-function fetchAuthStatus() {
-    fetch('/auth/status')
-        .then(response => response.json())
-        .then(data => {
-            isAuthenticated = data.isAuthenticated;
-            userInfo = data.user;
-            updateLoginStatusUI();
-            if (!isAuthenticated) {
-                alert('You must be logged in with Discord to draw on the canvas.');
-            }
-        })
-        .catch(err => console.error('Error fetching auth status:', err));
-}
-
-// ==================== Tool Selection and Configuration ====================
-
-// Tool Selection
-document.querySelectorAll('.tool-button').forEach(button => {
-    button.addEventListener('click', () => {
-        document.querySelectorAll('.tool-button').forEach(btn => btn.classList.remove('selected'));
-        button.classList.add('selected');
-        currentTool = button.id.replace('-tool', '');
-    });
-});
-
-// Color Selection
-document.querySelectorAll('.color-swatch').forEach(swatch => {
-    swatch.addEventListener('click', (e) => {
-        updateColorSwatches(e.target.getAttribute('data-color'));
-        currentColor = e.target.getAttribute('data-color');
-    });
-});
-
-// Pencil Size Slider
-const pencilSizeDisplay = document.getElementById('pencil-size-display');
-const pencilSizeSlider = document.getElementById('pencil-size-slider');
-
-pencilSizeSlider.addEventListener('input', (e) => {
-    pencilSize = parseInt(e.target.value, 10);
-    pencilSizeDisplay.textContent = pencilSize;
-});
-
-// ==================== Canvas Visibility Management ====================
-
-// Check if a canvas is visible within the viewport
-function isCanvasVisible(x, y) {
-    const canvasSize = CANVAS_SIZE;
-    const gap = GAP_SIZE;
-    const panX = currentPan.x;
-    const panY = currentPan.y;
-    const zoom = currentZoom;
-
-    let canvasX = x * (canvasSize + gap) * zoom + panX;
-    let canvasY = -y * (canvasSize + gap) * zoom + panY;
-
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const viewportWidthHalf = viewportWidth / 2;
-    const viewportHeightHalf = viewportHeight / 2;
-
-    canvasX += viewportWidthHalf;
-    canvasY += viewportHeightHalf;
-
-    const canvasWidth = canvasSize * zoom;
-    const canvasHeight = canvasSize * zoom;
-
-    return (
-        canvasX + canvasWidth >= 0 &&
-        canvasX <= viewportWidth &&
-        canvasY + canvasHeight >= 0 &&
-        canvasY <= viewportHeight
-    );
-}
-
-// Update the visibility of canvases based on their position
-function updateVisibleCanvases() {
-    canvases.forEach((canvasObj, canvasId) => {
-        const [x, y] = canvasId.split('|').map(Number);
+/**
+ * Updates the visibility of arrow buttons based on neighboring canvases.
+ * @param {number} x 
+ * @param {number} y 
+ */
+function updateArrowsVisibility(x, y) {
+    const directions = ['up', 'down', 'left', 'right'];
+    directions.forEach(direction => {
+        const neighborId = getNeighborCanvasId(generateCanvasId(x, y), direction);
         const wrapper = document.querySelector(`.canvas-wrapper[data-x="${x}"][data-y="${y}"]`);
-
-        if (isCanvasVisible(x, y)) {
-            if (!canvasObj.rendered) {
-                wrapper.style.display = '';
-                socket.emit('join-canvas', { canvasId });
-                canvasObj.rendered = true;
-            }
-        } else {
-            if (canvasObj.rendered) {
-                wrapper.style.display = 'none';
-                socket.emit('leave-canvas', { canvasId });
-                canvasObj.rendered = false;
-            }
+        const arrow = wrapper?.querySelector(`.arrow.${direction}`);
+        if (arrow) {
+            arrow.style.display = canvases.has(neighborId) ? 'none' : 'block';
         }
     });
 }
 
-// ==================== Socket.IO Event Handling ====================
+// Pan and Zoom Handling
 
-// Request initial canvas list
-socket.emit('request-canvas-list');
-
-// Handle updated canvas list from the server
-socket.on('update-canvas-list', ({ canvasList }) => {
-    canvasList.forEach(canvasId => {
-        const [x, y] = canvasId.split('|').map(Number);
-        createCanvasWrapper(x, y);
-    });
-
-    if (!canvasList.includes('0|0')) {
-        createCanvasWrapper(0, 0);
-    }
-
-    updateVisibleCanvases();
-});
-
-// Handle drawing events from other users
-socket.on('draw-pixel', (data) => {
-    const { canvasId, x, y, color, size, tool } = data;
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return;
-
-    const ctx = canvasObj.ctx;
-    ctx.fillStyle = color;
-    ctx.imageSmoothingEnabled = false;
-
-    if (size >= 3) {
-        drawCircle(ctx, x, y, size / 2, data.pixelInfo, canvasId);
-    } else if (size === 2) {
-        drawPlusShape(ctx, x, y, data.pixelInfo, canvasId);
-    } else {
-        ctx.fillRect(x, y, 1, 1);
-        updateCanvasData(canvasObj, x, y, data.pixelInfo);
-    }
-});
-
-// ==================== Tooltip Handling ====================
-
-// Handle mouse movement over the canvas map for tooltip display
-canvasMap.addEventListener('mousemove', (e) => {
-    const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
-    if (!targetCanvasWrapper) {
-        hidePixelInfo();
-        clearTimeout(hoverTimeout);
-        lastHoveredPixel = null;
-        return;
-    }
-
-    const canvasId = generateCanvasId(
-        Number(targetCanvasWrapper.dataset.x),
-        Number(targetCanvasWrapper.dataset.y)
-    );
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) {
-        hidePixelInfo();
-        clearTimeout(hoverTimeout);
-        lastHoveredPixel = null;
-        return;
-    }
-
-    const { x, y } = getCanvasCoordinates(e, canvasObj);
-    const key = `${x},${y}`;
-    const pixelData = canvasObj.canvasData[key] || null;
-
-    const currentHoveredPixel = { canvasId, x, y };
-    if (lastHoveredPixel && isSamePixel(lastHoveredPixel, currentHoveredPixel)) {
-        return;
-    }
-
-    clearTimeout(hoverTimeout);
-    lastHoveredPixel = currentHoveredPixel;
-
-    if (pixelData && pixelData.user) {
-        hoverTimeout = setTimeout(() => showPixelInfo(e, pixelData), HOVER_DELAY);
-    } else {
-        hidePixelInfo();
-    }
-});
-
-// Check if two pixels are the same
-function isSamePixel(pixelA, pixelB) {
-    return pixelA.canvasId === pixelB.canvasId && pixelA.x === pixelB.x && pixelA.y === pixelB.y;
-}
-
-// ==================== Pan and Zoom Initialization ====================
-
+/**
+ * Initializes pan and zoom functionalities.
+ */
 function initPanAndZoom() {
-    let isMousePanning = false;
+    let isMouseDownPan = false;
     let lastMousePosition = { x: 0, y: 0 };
+    let keysPressed = {};
+	let isSpacePressed = false;
 
-    // Touch variables for pinch-to-zoom
-    let lastTouchDistance = null;
-    let lastPanPosition = null;
-
-    // Prevent native pinch-to-zoom and other gestures
-    ['gesturestart', 'gesturechange', 'gestureend'].forEach(eventType => {
-        document.addEventListener(eventType, (e) => e.preventDefault(), { passive: false });
-    });
-
-    // Prevent double-finger scroll zooming in browsers
-    document.addEventListener('touchmove', (e) => {
-        if (e.touches.length > 1) {
-            e.preventDefault();
-        }
-    }, { passive: false });
-
-    // Prevent double-tap to zoom on mobile
-    document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
-
-    // Disable Ctrl + Zoom shortcuts on desktop
-    window.addEventListener('keydown', (e) => {
-        if ((e.ctrlKey || e.metaKey) && ['+', '=', '-', '0'].includes(e.key)) {
-            e.preventDefault();
-
-            if (e.key === '+' || e.key === '=') {
-                zoomIn();
-            } else if (e.key === '-') {
-                zoomOut();
-            }
-        }
-
-        if (e.code === 'Space') {
-            e.preventDefault();
-            isSpacePressed = true;
-            disableDrawing = true;
-            canvasMap.classList.add('grab');
-        }
-    });
-
-    window.addEventListener('keyup', (e) => {
-        if (e.code === 'Space') {
-            isSpacePressed = false;
-            disableDrawing = false;
-            canvasMap.classList.remove('grab');
-        }
-
-        if (keysPressed[e.key]) {
-            keysPressed[e.key] = false;
-        }
-    });
-
-    // Mouse wheel + Ctrl for zooming
-    document.addEventListener('wheel', (e) => {
-        if (e.ctrlKey) {
-            e.preventDefault();
-            const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
-            simulatePinchZoom(zoomFactor, e.clientX, e.clientY);
-        } else {
-            handleMouseWheelZoom(e);
-        }
-    }, { passive: false });
-
-    // Simulate pinch-to-zoom with mouse wheel
-    function simulatePinchZoom(zoomFactor, mouseX, mouseY) {
-        const rect = canvasMap.getBoundingClientRect();
-        const midpoint = { x: mouseX - rect.left, y: mouseY - rect.top };
-
-        let newZoom = currentZoom * zoomFactor;
-        newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
-        const zoomChange = newZoom / currentZoom;
-
-        currentPan.x -= midpoint.x * (zoomChange - 1);
-        currentPan.y -= midpoint.y * (zoomChange - 1);
-
-        currentZoom = newZoom;
-        updateCanvasMapTransform();
-    }
-
-    // Handle regular mouse wheel zooming
-    function handleMouseWheelZoom(e) {
-        e.preventDefault();
-        const rect = canvasMap.getBoundingClientRect();
-        const mouseX = e.clientX - rect.left;
-        const mouseY = e.clientY - rect.top;
-
-        const scaleFactor = ZOOM_SENSITIVITY;
-        const wheel = e.deltaY < 0 ? 1 : -1;
-
-        let newZoom = currentZoom * (1 + wheel * scaleFactor);
-        newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
-        const zoomChange = newZoom / currentZoom;
-
-        currentPan.x -= mouseX * (zoomChange - 1);
-        currentPan.y -= mouseY * (zoomChange - 1);
-
-        currentZoom = newZoom;
-        updateCanvasMapTransform();
-    }
-
-    // Mouse drag for panning (Shift + Left Click)
+    // Mouse Event Listeners for Panning with Middle Button and Space + Drag
     document.addEventListener('mousedown', (e) => {
-        if (e.shiftKey && e.button === 0) {
-            isMousePanning = true;
+        if (e.button === 1 || (e.button === 0 && isSpacePressed)) { // Middle button or Space + Left Click
+            e.preventDefault();
+			console.log("Panning");
+            isPanning = true;
+            isMouseDownPan = true;
+            disableDrawing = true;
             lastMousePosition = { x: e.clientX, y: e.clientY };
             canvasMap.classList.add('grabbing');
-            disableDrawing = true;
         }
+
     });
 
     document.addEventListener('mousemove', (e) => {
-        if (isMousePanning) {
-            const deltaX = e.clientX - lastMousePosition.x;
-            const deltaY = e.clientY - lastMousePosition.y;
-
-            currentPan.x += deltaX;
-            currentPan.y += deltaY;
-
-            lastMousePosition = { x: e.clientX, y: e.clientY };
-            updateCanvasMapTransform();
-        }
+        if (isPanning && isMouseDownPan){
+			const deltaX = e.clientX - lastMousePosition.x;
+			const deltaY = e.clientY - lastMousePosition.y;
+			pan(deltaX, deltaY);
+		}
+        lastMousePosition = { x: e.clientX, y: e.clientY };
     });
 
     document.addEventListener('mouseup', (e) => {
-        if (isMousePanning && e.button === 0) {
-            isMousePanning = false;
-            canvasMap.classList.remove('grabbing');
+        if ((isPanning && e.button === 1) || (isPanning && e.button === 0 && isSpacePressed)) { // Middle button release or Space + Left Click release
+            isPanning = false;
+            isMouseDownPan = false;
             disableDrawing = false;
+            canvasMap.classList.remove('grabbing');
         }
     });
 
-    // Touch events for pinch-to-zoom and panning
-    canvasMap.addEventListener('touchstart', handleTouchStart, { passive: false });
-    canvasMap.addEventListener('touchmove', handleTouchMove, { passive: false });
-    canvasMap.addEventListener('touchend', handleTouchEnd, { passive: false });
+	// allow simulating touch events by pinning a point with alt and then dragging
 
-    function handleTouchStart(e) {
-        if (e.touches.length === 2) {
-            e.preventDefault();
-            lastTouchDistance = getTouchDistance(e.touches);
-            lastPanPosition = getMidpoint(e.touches);
-        }
-    }
+	document.addEventListener('touchstart', touchStart);
 
-    function handleTouchMove(e) {
-        if (e.touches.length === 2) {
-            e.preventDefault();
+	function touchStart (e) {
+		if (e.touches.length === 2) {
+			const touch1 = e.touches[0];
+			const touch2 = e.touches[1];
+			const touchCenter = {
+				x: (touch1.clientX + touch2.clientX) / 2,
+				y: (touch1.clientY + touch2.clientY) / 2
+			};
+			lastMousePosition = { x: touchCenter.x, y: touchCenter.y };
+		}
+	}
 
-            const currentDistance = getTouchDistance(e.touches);
-            const midpoint = getMidpoint(e.touches);
+	var lastPinchDistance = -1;
 
-            if (lastTouchDistance !== null) {
-                const distanceDelta = currentDistance - lastTouchDistance;
-                if (Math.abs(distanceDelta) > 5) {
-                    const zoomFactor = 1 + (distanceDelta / currentDistance) * ZOOM_SENSITIVITY;
-                    let newZoom = currentZoom * zoomFactor;
-                    newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
-                    const zoomChange = newZoom / currentZoom;
+	document.addEventListener('touchmove', touchMove);
 
-                    currentPan.x -= midpoint.x * (zoomChange - 1);
-                    currentPan.y -= midpoint.y * (zoomChange - 1);
 
-                    currentZoom = newZoom;
-                }
-            }
 
-            lastTouchDistance = currentDistance;
+	function touchMove (e) {
+		console.log(e.touches.length)
+		if (e.touches.length === 2) {
+			console.log("Panning");
+			const touch1 = e.touches[0];
+			const touch2 = e.touches[1];
+			const touchCenter = {
+				x: (touch1.clientX + touch2.clientX) / 2,
+				y: (touch1.clientY + touch2.clientY) / 2
+			};
+			const deltaX = touchCenter.x - lastMousePosition.x;
+			const deltaY = touchCenter.y - lastMousePosition.y;
+			pan(deltaX, deltaY);
+			lastMousePosition = { x: touchCenter.x, y: touchCenter.y };
 
-            if (lastPanPosition) {
-                const deltaX = midpoint.x - lastPanPosition.x;
-                const deltaY = midpoint.y - lastPanPosition.y;
-                currentPan.x += deltaX;
-                currentPan.y += deltaY;
-            }
+			const distance = Math.hypot(touch1.clientX - touch2.clientX, touch1.clientY - touch2.clientY);
+			if (lastPinchDistance === -1) {
+				lastPinchDistance = distance;
+			}
 
-            lastPanPosition = midpoint;
-            updateCanvasMapTransform();
-        }
-    }
+			const pinchChange = distance - lastPinchDistance;
+			// zoom on the center of the pinch, make sure we zoom faster if the pinch distance is larger
+			const rect = canvasMap.getBoundingClientRect();
+			const mouseX = touchCenter.x - rect.left;
+			const mouseY = touchCenter.y - rect.top;
+			const scaleFactor = 0.005; // Control zoom speed here
+			const wheel = pinchChange
 
-    function handleTouchEnd(e) {
-        if (e.touches.length < 2) {
-            lastTouchDistance = null;
-            lastPanPosition = null;
-        }
-    }
+			// Apply exponential scaling for smoother zoom
+			let newZoom = currentZoom * (1 + wheel * scaleFactor);
 
-    // Add WASD and Arrow Key Panning
+			// Keep zoom within bounds
+			newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
+			const zoomChange = newZoom / currentZoom;
+
+			// Adjust panning to keep the mouse position in the same place
+			currentPan.x -= mouseX * (zoomChange - 1);
+			currentPan.y -= mouseY * (zoomChange - 1);
+
+			currentZoom = newZoom;
+
+			
+		
+			updateCanvasMapTransform();
+
+			lastPinchDistance = distance;
+
+		}
+	}
+
+	document.addEventListener('touchend', touchEnd);
+
+	function touchEnd (e) {
+		if (e.touches.length < 2) {
+			isPanning = false;
+			pinnedPoint = null;
+			lastPinchDistance = -1;
+		}
+	}
+
+
+    // Keyboard Event Listeners for Panning with WASD and Arrow Keys
     document.addEventListener('keydown', (e) => {
         if (['w', 'a', 's', 'd', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight'].includes(e.key)) {
             e.preventDefault();
             keysPressed[e.key] = true;
+        }
+        if (e.code === 'Space') {
+            e.preventDefault();
+            disableDrawing = true;
+            canvasMap.classList.add('grabbing');
+			isSpacePressed = true;
         }
     });
 
@@ -951,107 +936,130 @@ function initPanAndZoom() {
         if (keysPressed[e.key]) {
             keysPressed[e.key] = false;
         }
+        if (e.code === 'Space') {
+            disableDrawing = false;
+            canvasMap.classList.remove('grabbing');
+			isSpacePressed = false;
+        }
     });
 
-    // Smooth panning based on keys pressed
+    // Mouse Wheel for Zooming
+    document.addEventListener('wheel', (e) => {
+
+		e.preventDefault();
+		const rect = canvasMap.getBoundingClientRect();
+		const mouseX = e.clientX - rect.left;
+		const mouseY = e.clientY - rect.top;
+	
+		const scaleFactor = 0.1; // Control zoom speed here
+		const wheel = e.deltaY < 0 ? 1 : -1;
+		
+		// Apply exponential scaling for smoother zoom
+		let newZoom = currentZoom * (1 + wheel * scaleFactor);
+	
+		// Keep zoom within bounds
+		newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
+		const zoomChange = newZoom / currentZoom;
+	
+		// Adjust panning to keep the mouse position in the same place
+		currentPan.x -= mouseX * (zoomChange - 1);
+		currentPan.y -= mouseY * (zoomChange - 1);
+	
+		currentZoom = newZoom;
+		updateCanvasMapTransform();
+
+    }, { passive: false });
+
+    // Smooth Panning with Keyboard
     function smoothPan() {
-        if (keysPressed['w'] || keysPressed['ArrowUp']) {
-            currentPan.y += panSpeed;
-        }
-        if (keysPressed['s'] || keysPressed['ArrowDown']) {
-            currentPan.y -= panSpeed;
-        }
-        if (keysPressed['a'] || keysPressed['ArrowLeft']) {
-            currentPan.x += panSpeed;
-        }
-        if (keysPressed['d'] || keysPressed['ArrowRight']) {
-            currentPan.x -= panSpeed;
-        }
-
-        if (Object.values(keysPressed).includes(true)) {
-            updateCanvasMapTransform();
-        }
-
+        if (keysPressed['w'] || keysPressed['ArrowUp']) pan(0, PAN_SPEED);
+        if (keysPressed['s'] || keysPressed['ArrowDown']) pan(0, -PAN_SPEED);
+        if (keysPressed['a'] || keysPressed['ArrowLeft']) pan(PAN_SPEED, 0);
+        if (keysPressed['d'] || keysPressed['ArrowRight']) pan(-PAN_SPEED, 0);
         requestAnimationFrame(smoothPan);
     }
+	
     smoothPan();
+
+    /**
+     * Pans the canvas map by the specified deltas.
+     * @param {number} deltaX 
+     * @param {number} deltaY 
+     */
+    function pan(deltaX, deltaY) {
+        currentPan.x += deltaX;
+        currentPan.y += deltaY;
+        updateCanvasMapTransform();
+    }
+
 }
 
-// Calculate distance between two touch points
-function getTouchDistance(touches) {
-    const [touch1, touch2] = touches;
-    const dx = touch1.clientX - touch2.clientX;
-    const dy = touch1.clientY - touch2.clientY;
-    return Math.hypot(dx, dy);
+/**
+ * Updates the transformation of the canvas map based on pan and zoom.
+ */
+function updateCanvasMapTransform() {
+    canvasMap.style.transform = `translate(${currentPan.x}px, ${currentPan.y}px) scale(${currentZoom})`;
+    updateVisibleCanvases();
 }
 
-// Calculate midpoint between two touch points
-function getMidpoint(touches) {
-    const [touch1, touch2] = touches;
-    return {
-        x: (touch1.clientX + touch2.clientX) / 2,
-        y: (touch1.clientY + touch2.clientY) / 2
-    };
-}
+// Canvas Management
 
-// Zoom in by a fixed factor
-function zoomIn() {
-    const zoomFactor = 0.2;
-    let newZoom = currentZoom + zoomFactor;
-    if (newZoom > MAX_ZOOM) return;
-
-    const zoomChange = newZoom / currentZoom;
-    currentPan.x *= zoomChange;
-    currentPan.y *= zoomChange;
-
-    currentZoom = newZoom;
-    updateCanvasMapTransform();
-}
-
-// Zoom out by a fixed factor
-function zoomOut() {
-    const zoomFactor = 0.2;
-    let newZoom = currentZoom - zoomFactor;
-    if (newZoom < MIN_ZOOM) return;
-
-    const zoomChange = newZoom / currentZoom;
-    currentPan.x *= zoomChange;
-    currentPan.y *= zoomChange;
-
-    currentZoom = newZoom;
-    updateCanvasMapTransform();
-}
-
-// ==================== Initialization ====================
-
+/**
+ * Initializes the canvas map on page load.
+ */
 window.onload = () => {
     fetchAuthStatus();
-    socket.emit('request-canvas-list');
+
+    // Prevent native pinch-to-zoom and other default behaviors
+    ['gesturestart', 'gesturechange', 'gestureend', 'touchmove', 'dblclick'].forEach(event => {
+        document.addEventListener(event, (e) => e.preventDefault(), { passive: false });
+    });
+
+    // Initialize pan and zoom functionalities
     initPanAndZoom();
 
-    // Prevent double-tap to zoom on mobile
-    document.addEventListener('dblclick', (e) => e.preventDefault(), { passive: false });
+    // Request initial canvas list from server
+    socket.emit('request-canvas-list');
+
+    socket.on('update-canvas-list', ({ canvasList }) => {
+        canvasList.forEach(canvasId => {
+            const [x, y] = canvasId.split('|').map(Number);
+            createCanvasWrapper(x, y);
+        });
+
+        if (!canvasList.includes('0|0')) {
+            createCanvasWrapper(0, 0);
+        }
+
+        updateVisibleCanvases();
+    });
+
+    // Handle incoming draw-pixel events
+    socket.on('draw', (data) => {
+        const { canvasId, x, y, color, size, tool, user, timestamp } = data;
+        const canvasObj = canvases.get(canvasId);
+        if (!canvasObj) return;
+
+        canvasObj.ctx.fillStyle = color;
+        canvasObj.ctx.imageSmoothingEnabled = false;
+
+        
+        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId);
+     
+    });
 };
 
-// ==================== Canvas Visibility Update on Resize ====================
-
-window.addEventListener('resize', updateVisibleCanvases);
-
-// ==================== Helper Functions ====================
-
-// Get canvas coordinates from mouse or touch event
-function getCanvasCoordinates(event, canvasObj) {
-    const rect = canvasObj.canvas.getBoundingClientRect();
-    const scaleX = canvasObj.canvas.width / rect.width;
-    const scaleY = canvasObj.canvas.height / rect.height;
-
-    if (event.touches && event.touches.length > 0) {
-        const x = Math.floor((event.touches[0].clientX - rect.left) * scaleX);
-        const y = Math.floor((event.touches[0].clientY - rect.top) * scaleY);
-        return { x, y };
-    } else {
-        const x = Math.floor((event.clientX - rect.left) * scaleX);
-        const y = Math.floor((event.clientY - rect.top) * scaleY);
-        return { x, y };
+// Prevent Ctrl + Zoom on Desktop
+window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && ['+', '-', '=', '0'].includes(e.key)) {
+        e.preventDefault();
     }
+});
+
+// Initial Canvas Setup
+function initializeCanvases() {
+    // This function can be expanded if needed
 }
+
+// Start initialization
+initializeCanvases();

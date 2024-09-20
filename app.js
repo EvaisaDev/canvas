@@ -117,8 +117,6 @@ function createCanvas(canvasId) {
 
 // Save interval setup
 const saveInterval = 60000; // Save every 60 seconds
-let saveTimeouts = new Map(); // To track timeouts per canvas
-
 // Function to periodically save canvases with changes
 function saveAllCanvases() {
     canvases.forEach((canvas, canvasId) => {
@@ -130,26 +128,18 @@ function saveAllCanvases() {
     });
 }
 
+function loadAllCanvases() {
+	canvasEnmap.forEach((canvas, canvasId) => {
+		canvases.set(canvasId, canvas);
+		console.log(`Canvas ${canvasId} loaded.`);
+	});
+}
+
+loadAllCanvases();
+
 // Set interval to save all canvases periodically
 setInterval(saveAllCanvases, saveInterval);
 
-// Canvas expiration and cleanup 48 hours
-/*
-const canvasExpirationTime = 48 * 60 * 60; // 48 hours in seconds
-
-function cleanupInactiveCanvases() {
-    const currentTime = getCurrentTimestamp();
-    canvases.forEach((canvas, canvasId) => {
-        if (currentTime - canvas.lastAccessed > canvasExpirationTime) {
-            canvases.delete(canvasId);
-            canvasEnmap.delete(canvasId); // Optionally remove from Enmap
-            console.log(`Canvas ${canvasId} deleted due to inactivity.`);
-        }
-    });
-}
-
-setInterval(cleanupInactiveCanvases, 48 * 60 * 60 * 1000); // Cleanup every 48 hours
-*/
 
 io.on('connection', (socket) => {
     console.log('A user connected');
@@ -232,7 +222,7 @@ io.on('connection', (socket) => {
 
 
     // Listen for drawing events
-    socket.on('draw-pixel', (data) => {
+    socket.on('draw', (data) => {
         const { canvasId, x, y, color, size, tool } = data;
 
         // Authentication check
@@ -240,6 +230,8 @@ io.on('connection', (socket) => {
             socket.emit('error', { message: 'Unauthorized. Please log in with Discord.' });
             return;
         }
+
+		console.log(`User ${session.id} drew on canvas ${canvasId}`);
 
         // Ensure the canvas exists
         let canvas = canvases.get(canvasId);
@@ -255,40 +247,32 @@ io.on('connection', (socket) => {
 
         // Update the canvas data
         const canvasData = canvas.data;
-        const radius = Math.floor(size / 2);
         const timestamp = Date.now();
         const user = {
             id: session.passport.user.id,
             username: session.passport.user.username
         };
 
-        for (let dx = -radius; dx <= radius; dx++) {
-            for (let dy = -radius; dy <= radius; dy++) {
-                if (size >= 3) {
-                    if (dx * dx + dy * dy <= radius * radius - radius * 0.8) {
-                        const pixelX = x + dx;
-                        const pixelY = y + dy;
-                        const key = `${pixelX},${pixelY}`;
-                        canvasData[key] = { color: color, user, timestamp };
-                    }
-                } else if (size === 2) {
-                    if (dx === 0 || dy === 0) {
-                        const pixelX = x + dx;
-                        const pixelY = y + dy;
-                        const key = `${pixelX},${pixelY}`;
-                        canvasData[key] = { color: color, user, timestamp };
-                    }
-                } else if (size === 1 && dx === 0 && dy === 0) {
-                    const key = `${x},${y}`;
-                    canvasData[key] = { color: color, user, timestamp };
-                }
-            }
-        }
+		const radius = size / 2;
+		const center = radius - 0.5;
+		for (let yOffset = 0; yOffset < size; yOffset++) {
+			for (let xOffset = 0; xOffset < size; xOffset++) {
+				const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
+				if (distance < radius) {
+					const pixelX = x + xOffset - radius + 1;
+					const pixelY = y + yOffset - radius + 1;
+					const key = `${pixelX},${pixelY}`;
+					canvasData[key] = { color: color, user, timestamp };
+				}
+			}
+		}
+
+
 
         data.pixelInfo = { color: color, user, timestamp };
 
         // Broadcast to all other clients in the same canvas
-        socket.to(`canvas-${canvasId}`).emit('draw-pixel', data);
+        socket.to(`canvas-${canvasId}`).emit('draw', data);
     });
 
     // Listen for canvas save events (optional)
@@ -310,14 +294,6 @@ io.on('connection', (socket) => {
     // Handle disconnection
     socket.on('disconnect', () => {
         console.log('A user disconnected');
-        if (currentCanvasId !== null) {
-            let canvas = canvases.get(currentCanvasId);
-            if (canvas) {
-                canvas.viewers--;
-
-                // Optionally, implement canvas cleanup based on viewer count or last accessed time
-            }
-        }
     });
 });
 
