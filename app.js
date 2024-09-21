@@ -224,6 +224,7 @@ io.on('connection', (socket) => {
         const canvasData = canvas.data;
         const timestamp = Date.now();
 
+		const updatedPixels = [];
         for (let yOffset = 0; yOffset < size; yOffset++) {
             for (let xOffset = 0; xOffset < size; xOffset++) {
                 const dx = xOffset - center;
@@ -242,12 +243,17 @@ io.on('connection', (socket) => {
                     }
 
                     canvasData[key] = { color, user, timestamp };
+					updatedPixels.push({ x: pixelX, y: pixelY, color, user, timestamp });
                 }
             }
         }
 
-        const pixelInfo = { color, user, timestamp };
-        io.to(`canvas-${canvasId}`).emit('draw', { ...data, user, timestamp });
+        //const pixelInfo = { color, user, timestamp };
+        //io.to(`canvas-${canvasId}`).emit('draw', { ...data, user, timestamp });
+
+		// Send only the updated pixels to the client
+		io.to(`canvas-${canvasId}`).emit('update-canvas', {canvasId, updatedPixels });
+
     });
 
     // Provide canvas list

@@ -11,6 +11,60 @@ const MAX_ZOOM = 20;
 const ZOOM_SENSITIVITY = 0.005;
 const PAN_SPEED = 2;
 
+// Vertex Shader Source
+const vertexShaderSource = `#version 300 es
+    precision mediump float;
+    in vec2 a_position;
+    in vec2 a_texCoord;
+    out vec2 v_texCoord;
+    void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+    }
+`;
+
+// Fragment Shader Source
+const fragmentShaderSource = `#version 300 es
+    precision mediump float;
+    in vec2 v_texCoord;
+    out vec4 outColor;
+    uniform sampler2D u_texture;
+    void main() {
+        outColor = texture(u_texture, v_texCoord);
+    }
+`;
+
+// Utility function to create and compile a shader
+function createShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    const success = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
+    if (success) {
+        return shader;
+    }
+    console.error('Shader compilation failed:', gl.getShaderInfoLog(shader));
+    gl.deleteShader(shader);
+    return null;
+}
+
+// Utility function to create a shader program
+function createProgram(gl, vertexShader, fragmentShader) {
+    const program = gl.createProgram();
+    if (!program) return null;
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+    const success = gl.getProgramParameter(program, gl.LINK_STATUS);
+    if (success) {
+        return program;
+    }
+    console.error('Program linking failed:', gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    return null;
+}
+
 // DOM Elements
 const canvasMap = document.getElementById('canvas-map');
 const loadingIndicator = document.getElementById('loading-indicator');
@@ -38,7 +92,10 @@ let currentZoom = 1;
 let hoverTimeout = null;
 let lastHoveredPixel = null;
 let disableDrawing = false;
-const canvases = new Map(); // key: 'x|y', value: { canvas, ctx, canvasData, rendered }
+const canvases = new Map(); // key: 'x|y', value: { canvas, gl, program, vao, texture, pixelData, needsUpdate, updateQueue }
+
+// Unique Client ID
+let clientId = null;
 
 // Tool Classes
 
@@ -59,12 +116,11 @@ class DrawingTool extends Tool {
         super(name);
         this.isEraser = isEraser;
         this.lastPosition = null;
-		this.extra_data = {
-			targetColor: null
-		};
+        this.extra_data = {
+            targetColor: null,
+            ...extra_data
+        };
     }
-
-	
 
     onMouseDown(e, canvasObj) {
         if (!isAuthenticated) return;
@@ -82,7 +138,7 @@ class DrawingTool extends Tool {
         }
     }
 
-    onMouseUp() {
+    onMouseUp(e, canvasObj) {
         isDrawing = false;
         currentCanvasObj = null;
         this.lastPosition = null;
@@ -100,19 +156,16 @@ class DrawingTool extends Tool {
     }
 
     plotPoint(canvasObj, x, y, drawColor) {
-        // Plot within current canvas
-        const adjustedColor = this.isEraser ? '#FFFFFF' : drawColor;
-        drawPixel(canvasObj, x, y, adjustedColor, userInfo);
-
-        // Emit draw event
+        // Emit draw event with clientId
         socket.emit('draw', {
+            clientId,
             canvasId: canvasObj.id,
             x,
             y,
-            color: adjustedColor,
+            color: drawColor,
             size: pencilSize,
             tool: this.name,
-			extra_data: this.extra_data,
+            extra_data: this.extra_data,
             user: userInfo,
             timestamp: Date.now()
         });
@@ -127,30 +180,28 @@ class DrawingTool extends Tool {
             let interpolatedX = Math.round(x1 + t * (x2 - x1));
             let interpolatedY = Math.round(y1 + t * (y2 - y1));
 
-			this.plotPoint(canvasObj, interpolatedX, interpolatedY, drawColor);
+            this.plotPoint(canvasObj, interpolatedX, interpolatedY, drawColor);
         }
     }
 }
 
 class MarkerTool extends DrawingTool {
-	constructor(name, isEraser = false, extra_data = {}) {
-		super(name, isEraser, extra_data);
-	}
+    constructor(name, isEraser = false, extra_data = {}) {
+        super(name, isEraser, extra_data);
+    }
 
-	onMouseDown(e, canvasObj) {
+    onMouseDown(e, canvasObj) {
         if (!isAuthenticated) return;
         isDrawing = true;
         currentCanvasObj = canvasObj;
         const { x, y } = getCanvasCoordinates(e, canvasObj);
         this.lastPosition = { x, y };
 
-
-
-		const targetColor = getPixelColor(canvasObj, x, y);
-		this.extra_data.targetColor = targetColor;
+        const targetColor = getPixelColor(canvasObj, x, y);
+        this.extra_data.targetColor = targetColor;
         const drawColor = this.isEraser ? '#FFFFFF' : currentColor;
         this.plotPoint(canvasObj, x, y, drawColor);
-	}
+    }
 }
 
 // Color Picker Tool
@@ -170,7 +221,7 @@ class ColorPickerTool extends Tool {
 // Initialize Tools
 const tools = {
     'pencil': new DrawingTool('pencil'),
-	'highlighter': new MarkerTool('highlighter'),
+    'highlighter': new MarkerTool('highlighter'),
     'eraser': new DrawingTool('eraser', true),
     'color-picker': new ColorPickerTool('color-picker')
 };
@@ -181,58 +232,36 @@ document.getElementById('pencil-tool').classList.add('selected');
 
 // Utility Functions
 
-/**
- * Translates mouse or touch event to canvas coordinates.
- * @param {MouseEvent | TouchEvent} e - The event object.
- * @param {object} canvasObj - The canvas object.
- * @returns {object} - An object containing x and y coordinates.
- */
 function getCanvasCoordinates(e, canvasObj) {
     const rect = canvasObj.canvas.getBoundingClientRect();
-    const scaleX = canvasObj.canvas.width / rect.width;
-    const scaleY = canvasObj.canvas.height / rect.height;
+    const scaleX = CANVAS_SIZE / rect.width;
+    const scaleY = CANVAS_SIZE / rect.height;
+
+    let clientX, clientY;
 
     if (e.touches && e.touches.length > 0) {
-        const x = Math.floor((e.touches[0].clientX - rect.left) * scaleX);
-        const y = Math.floor((e.touches[0].clientY - rect.top) * scaleY);
-        return { x, y };
+        clientX = e.touches[0].clientX;
+        clientY = e.touches[0].clientY;
     } else {
-        const x = Math.floor((e.clientX - rect.left) * scaleX);
-        const y = Math.floor((e.clientY - rect.top) * scaleY);
-        return { x, y };
+        clientX = e.clientX;
+        clientY = e.clientY;
     }
+
+    const x = Math.floor((clientX - rect.left) * scaleX);
+    const y = CANVAS_SIZE - 1 - Math.floor((clientY - rect.top) * scaleY);
+    return { x, y };
 }
 
-/**
- * Checks if the coordinates are within the canvas boundaries.
- * @param {number} x - X-coordinate
- * @param {number} y - Y-coordinate
- * @param {object} canvasObj - Canvas object
- * @returns {boolean}
- */
 function isWithinCanvas(x, y, canvasObj) {
-    return x >= 0 && x < canvasObj.canvas.width && y >= 0 && y < canvasObj.canvas.height;
+    return x >= 0 && x < CANVAS_SIZE && y >= 0 && y < CANVAS_SIZE;
 }
 
-/**
- * Wraps the coordinate if it goes beyond canvas boundaries.
- * @param {number} coord - Coordinate value
- * @param {number} max - Maximum value (width or height)
- * @returns {number}
- */
 function wrapCoordinate(coord, max) {
     if (coord < 0) return max - 1;
     if (coord >= max) return 0;
     return coord;
 }
 
-/**
- * Determines the direction based on edge crossing.
- * @param {number} x - X-coordinate
- * @param {number} y - Y-coordinate
- * @param {object} canvasObj - Canvas object
- * @returns {string|null}
- */
 function getDirectionFromEdge(x, y, canvasObj) {
     if (x < 0) return 'left';
     if (x >= canvasObj.canvas.width) return 'right';
@@ -241,12 +270,6 @@ function getDirectionFromEdge(x, y, canvasObj) {
     return null;
 }
 
-/**
- * Gets the neighbor canvas ID based on direction.
- * @param {string} currentId - Current canvas ID
- * @param {string} direction - Direction of the neighbor
- * @returns {string|null}
- */
 function getNeighborCanvasId(currentId, direction) {
     const [x, y] = currentId.split('|').map(Number);
     switch(direction) {
@@ -258,95 +281,56 @@ function getNeighborCanvasId(currentId, direction) {
     }
 }
 
-/**
- * Draws a pixel or a brush based on the current brush size.
- * @param {object} canvasObj - Canvas object
- * @param {number} x - X-coordinate
- * @param {number} y - Y-coordinate
- * @param {string} color - Color to draw
- */
 function drawPixel(canvasObj, x, y, color, username = "unknown") {
-    const ctx = canvasObj.ctx;
-    ctx.fillStyle = color;
-    ctx.imageSmoothingEnabled = false;
+    if (!isWithinCanvas(x, y, canvasObj)) return;
 
-    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id, username);
+    const rgba = hexToRgba(color);
+    const index = (y * CANVAS_SIZE + x) * 4;
+    canvasObj.pixelData.set([rgba.r, rgba.g, rgba.b, 255], index);
+
+    canvasObj.needsUpdate = true; // Set flag for texture update
 }
 
-/**
- * Draws a circular brush with configurable pixel size, optimized by reducing the number of fillRect calls.
- * @param {CanvasRenderingContext2D} ctx - Canvas context
- * @param {number} x - X-coordinate
- * @param {number} y - Y-coordinate
- * @param {number} size - Radius of the brush
- * @param {string} color - Color to draw
- * @param {string} canvasId - ID of the canvas
- */
-function drawBrush(ctx, x, y, size, color, canvasId, username = "unknown") {
-    const radius = size / 2;
-    const center = radius - 0.5;
-    const canvasObj = canvases.get(canvasId);
-    if (!canvasObj) return;
+function drawBrush(gl, canvasObj, x, y, size, color, canvasId, username = "unknown") {
+    const radius = Math.floor(size / 2);
+    const rgba = hexToRgba(color);
 
-	ctx.imageSmoothingEnabled = false;
-    
-    // Function to draw squares efficiently
-    function drawSquare(x, y, width, height) {
-        ctx.fillStyle = color;
-        ctx.fillRect(x, y, width, height);
-
-        const pixelData = { color, user: username, timestamp: Date.now() };
-        let index = (y * CANVAS_SIZE) + x;
-
-        if (canvasObj.canvasData === undefined) {
-            canvasObj.canvasData = new Set();
-            for (let i = 0; i < CANVAS_SIZE * CANVAS_SIZE; i++) {
-                canvasObj.canvasData.add({ color: "#FFFFFF", user: null, timestamp: 0 });
-            }
-        }
-        canvasObj.canvasData[index] = pixelData;
-    }
-
-    // Loop over the brush area
-    for (let yOffset = 0; yOffset < size; yOffset++) {
-        for (let xOffset = 0; xOffset < size; xOffset++) {
-            const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
-            if (distance < radius) {
-                // Try to fill the largest possible square that fits in the circle
-
-                // Determine the largest square that can be packed inside the current area
-                let squareSize = 1;
-                while (distance + squareSize - 1 < radius && xOffset + squareSize <= size && yOffset + squareSize <= size) {
-                    squareSize++;
+    for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+            if (dx * dx + dy * dy <= radius * radius) {
+                const px = x + dx;
+                const py = y + dy;
+                if (px >= 0 && px < CANVAS_SIZE && py >= 0 && py < CANVAS_SIZE) {
+                    const index = (py * CANVAS_SIZE + px) * 4;
+                    canvasObj.pixelData.set([rgba.r, rgba.g, rgba.b, 255], index);
                 }
-                squareSize--; // Reduce to fit inside the circle
-
-                // Draw the square
-                drawSquare(x + xOffset - radius + 1, y + yOffset - radius + 1, squareSize, squareSize);
-
-                // Skip the pixels that were filled by the square
-                xOffset += squareSize - 1;
             }
         }
     }
+
+    canvasObj.needsUpdate = true; // Set flag for texture update
 }
 
+function hexToRgba(hex) {
+    let bigint = parseInt(hex.slice(1), 16);
+    let r = (bigint >> 16) & 255;
+    let g = (bigint >> 8) & 255;
+    let b = bigint & 255;
+    return { r, g, b, a: 255 };
+}
 
+function rgbaToHex(rgba) {
+    return `#${((1 << 24) + (rgba.r << 16) + (rgba.g << 8) + rgba.b).toString(16).slice(1).toUpperCase()}`;
+}
 
 function getPixelColor(canvasObj, x, y) {
-	var key = (y * CANVAS_SIZE) + x;
-
-	if (canvasObj.canvasData[key]) {
-		return canvasObj.canvasData[key].color;
-	} else {
-		return "#FFFFFF";
-	}
+    const index = (y * CANVAS_SIZE + x) * 4;
+    const r = canvasObj.pixelData[index];
+    const g = canvasObj.pixelData[index + 1];
+    const b = canvasObj.pixelData[index + 2];
+    return rgbaToHex({ r, g, b, a: 255 });
 }
 
-/**
- * Updates the selected color swatch.
- * @param {string} color - Selected color
- */
 function updateColorSwatches(color) {
     colorSwatches.forEach(swatch => {
         swatch.classList.toggle('selected', swatch.getAttribute('data-color').toLowerCase() === color.toLowerCase());
@@ -355,14 +339,8 @@ function updateColorSwatches(color) {
 
 // Event Handlers
 
-/**
- * Handles global mouse down events for drawing.
- * @param {MouseEvent} e 
- */
 function handleMouseDown(e) {
-    if (disableDrawing || e.button !== 0) return; // Only left-click
-
-	if(e.target.closest == undefined) return;
+    if (disableDrawing || e.button !== 0) return;
 
     const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
     if (!targetCanvasWrapper) return;
@@ -377,34 +355,8 @@ function handleMouseDown(e) {
     }
 }
 
-/**
-* Handles global touch start events for drawing.
-* @param {TouchEvent} e 
-*/
-function handleTouchStart(e) {
-	if (disableDrawing) return;
-	const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
-	if (!targetCanvasWrapper) return;
-
-	const x = Number(targetCanvasWrapper.getAttribute('data-x'));
-	const y = Number(targetCanvasWrapper.getAttribute('data-y'));
-	const canvasId = `${x}|${y}`;
-	const canvasObj = canvases.get(canvasId);
-	if (canvasObj) {
-		const tool = tools[currentTool];
-		tool?.onMouseDown(e, canvasObj);
-	}
-}
-
-/**
- * Handles global mouse move events for drawing.
- * @param {MouseEvent} e 
- */
 function handleMouseMove(e) {
     if (!isDrawing) return;
-
-	// make sure e.target.closest is defined
-	if(e.target.closest == undefined) return
 
     const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
     if (!targetCanvasWrapper || !currentCanvasObj) return;
@@ -414,54 +366,26 @@ function handleMouseMove(e) {
     const canvasId = `${x}|${y}`;
     const canvasObj = canvases.get(canvasId);
     if (canvasObj) {
-
-		// if canvasObj is not the same as currentCanvasObj, do onMouseUp on currentCanvasObj and onMouseDown on canvasObj
-		if (canvasObj !== currentCanvasObj) {
-			console.log("Mouse up on currentCanvasObj and mouse down on canvasObj");
-			const tool = tools[currentTool];
-			tool?.onMouseUp(e, currentCanvasObj);
-			tool?.onMouseDown(e, canvasObj);
-			currentCanvasObj = canvasObj;	
-		}
-
+        if (canvasObj !== currentCanvasObj) {
+            const tool = tools[currentTool];
+            tool?.onMouseUp(e, currentCanvasObj);
+            tool?.onMouseDown(e, canvasObj);
+            currentCanvasObj = canvasObj;
+        }
 
         const tool = tools[currentTool];
         tool?.onMouseMove(e, canvasObj);
     }
 }
 
-/**
-* Handles global touch move events for drawing.
-* @param {TouchEvent} e 
-*/
-function handleTouchMove(e) {
-	if (!isDrawing) return;
-	const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
-	if (!targetCanvasWrapper || !currentCanvasObj) return;
-
-	const x = Number(targetCanvasWrapper.getAttribute('data-x'));
-	const y = Number(targetCanvasWrapper.getAttribute('data-y'));
-	const canvasId = `${x}|${y}`;
-	const canvasObj = canvases.get(canvasId);
-	if (canvasObj) {
-		const tool = tools[currentTool];
-		tool?.onMouseMove(e, canvasObj);
-	}
-}
-
-/**
- * Handles global mouse up events for drawing.
- * @param {MouseEvent} e 
- */
 function handleMouseUp(e) {
     if (!isDrawing) return;
-	if(e.target.closest == undefined) return
     const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
     if (!targetCanvasWrapper || !currentCanvasObj) {
-		const tool = tools[currentTool];
+        const tool = tools[currentTool];
         tool?.onMouseUp(e, null);
-		return;
-	}
+        return;
+    }
 
     const x = Number(targetCanvasWrapper.getAttribute('data-x'));
     const y = Number(targetCanvasWrapper.getAttribute('data-y'));
@@ -473,34 +397,10 @@ function handleMouseUp(e) {
     }
 }
 
-/**
-* Handles global touch end events for drawing.
-* @param {TouchEvent} e
-*/
-function handleTouchEnd(e) {
-	if (!isDrawing) return;
-	const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
-	if (!targetCanvasWrapper || !currentCanvasObj) return;
-
-	const x = Number(targetCanvasWrapper.getAttribute('data-x'));
-	const y = Number(targetCanvasWrapper.getAttribute('data-y'));
-	const canvasId = `${x}|${y}`;
-	const canvasObj = canvases.get(canvasId);
-	if (canvasObj) {
-		const tool = tools[currentTool];
-		tool?.onMouseUp(e, canvasObj);
-	}
-}
-
 // Global Event Listeners for Drawing
 document.addEventListener('mousedown', handleMouseDown);
 document.addEventListener('mousemove', handleMouseMove);
 document.addEventListener('mouseup', handleMouseUp);
-// touch events
-document.addEventListener('touchstart', handleTouchStart);
-document.addEventListener('touchmove', handleTouchMove);
-document.addEventListener('touchend', handleTouchEnd);
-
 
 // Tooltip Handling
 canvasMap.addEventListener('mousemove', (e) => {
@@ -525,9 +425,14 @@ canvasMap.addEventListener('mousemove', (e) => {
 
     const { x: pixelX, y: pixelY } = getCanvasCoordinates(e, canvasObj);
     const key = (pixelY * CANVAS_SIZE) + pixelX;
-    const pixelData = canvasObj.canvasData?.[key] || null;
+    const pixelData = canvasObj.pixelData.slice(key * 4, key * 4 + 4); // Get RGBA values
 
-    const currentHoveredPixel = { canvasId, x: pixelX, y: pixelY };
+    const currentHoveredPixel = { 
+        canvasId, 
+        x: pixelX, 
+        y: pixelY, 
+        color: rgbaToHex({ r: pixelData[0], g: pixelData[1], b: pixelData[2], a: pixelData[3] }) 
+    };
     if (lastHoveredPixel && 
         lastHoveredPixel.canvasId === canvasId && 
         lastHoveredPixel.x === pixelX && 
@@ -538,31 +443,23 @@ canvasMap.addEventListener('mousemove', (e) => {
     clearTimeout(hoverTimeout);
     lastHoveredPixel = currentHoveredPixel;
 
-    if (pixelData && pixelData.user) {
-        showPixelInfo(e, pixelData);
-    } else {
-        hidePixelInfo();
-    }
+    // Delay tooltip display for better UX
+    hoverTimeout = setTimeout(() => {
+        showPixelInfo(e, currentHoveredPixel);
+    }, 300);
 });
 
-/**
- * Displays pixel information tooltip.
- * @param {MouseEvent} e 
- * @param {object} info 
- */
 function showPixelInfo(e, info) {
     tooltip.innerHTML = `
-        <strong>Placed by:</strong> ${info.user.username}<br>
-        <strong>At:</strong> ${new Date(info.timestamp).toLocaleString()}
+        <strong>Color:</strong> ${info.color}<br>
+        <strong>Position:</strong> (${info.x}, ${info.y})<br>
+        <strong>Canvas:</strong> ${info.canvasId}<br>
     `;
     tooltip.style.left = `${e.pageX + GAP_SIZE}px`;
     tooltip.style.top = `${e.pageY + GAP_SIZE}px`;
     tooltip.style.display = 'block';
 }
 
-/**
- * Hides the pixel information tooltip.
- */
 function hidePixelInfo() {
     tooltip.style.display = 'none';
     clearTimeout(hoverTimeout);
@@ -570,9 +467,6 @@ function hidePixelInfo() {
 
 // Authentication and User Info Handling
 
-/**
- * Updates the login/logout UI based on authentication status.
- */
 function updateLoginStatusUI() {
     if (isAuthenticated) {
         loginButton.style.display = 'none';
@@ -589,9 +483,6 @@ function updateLoginStatusUI() {
     }
 }
 
-/**
- * Fetches the authentication status from the server.
- */
 function fetchAuthStatus() {
     fetch('/auth/status')
         .then(response => response.json())
@@ -624,16 +515,6 @@ colorSwatches.forEach(swatch => {
     });
 });
 
-/**
- * Updates the color swatches to reflect the selected color.
- * @param {string} color 
- */
-function updateColorSwatches(color) {
-    colorSwatches.forEach(swatch => {
-        swatch.classList.toggle('selected', swatch.getAttribute('data-color').toLowerCase() === color.toLowerCase());
-    });
-}
-
 // Pencil Size Slider Event Listener
 pencilSizeSlider.addEventListener('input', (e) => {
     pencilSize = parseInt(e.target.value, 10);
@@ -642,12 +523,6 @@ pencilSizeSlider.addEventListener('input', (e) => {
 
 // Canvas Visibility and Management
 
-/**
- * Checks if a canvas is visible within the current viewport.
- * @param {number} x 
- * @param {number} y 
- * @returns {boolean}
- */
 function isCanvasVisible(x, y) {
     const canvasSize = CANVAS_SIZE;
     const gap = GAP_SIZE;
@@ -672,9 +547,6 @@ function isCanvasVisible(x, y) {
     return !(canvasX + canvasWidth < 0 || canvasX > viewportWidth || canvasY + canvasHeight < 0 || canvasY > viewportHeight);
 }
 
-/**
- * Updates the visibility of canvases based on their position.
- */
 function updateVisibleCanvases() {
     canvases.forEach((canvasObj, canvasId) => {
         const [x, y] = canvasId.split('|').map(Number);
@@ -696,23 +568,206 @@ function updateVisibleCanvases() {
     });
 }
 
-/**
- * Positions a canvas wrapper based on its coordinates.
- * @param {HTMLElement} wrapper 
- * @param {number} x 
- * @param {number} y 
- */
 function positionCanvas(wrapper, x, y) {
     wrapper.style.left = `${x * (CANVAS_SIZE + GAP_SIZE)}px`;
     wrapper.style.top = `${-y * (CANVAS_SIZE + GAP_SIZE)}px`;
 }
 
-/**
- * Creates a new canvas wrapper at specified coordinates.
- * @param {number} x 
- * @param {number} y 
- * @param {boolean} alreadyLoaded 
- */
+function initializeWebGL(canvas) {
+    const gl = canvas.getContext('webgl2');
+    if (!gl) {
+        console.error('WebGL2 not supported in this browser.');
+        return null;
+    }
+
+    // Set pixel storage mode
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); // Ensure tight packing
+
+    // Compile shaders and link program
+    const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
+    const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+    const program = createProgram(gl, vertexShader, fragmentShader);
+    if (!program) {
+        return null;
+    }
+
+    // Get attribute and uniform locations once
+    const positionAttributeLocation = gl.getAttribLocation(program, 'a_position');
+    const texCoordAttributeLocation = gl.getAttribLocation(program, 'a_texCoord');
+    const textureUniformLocation = gl.getUniformLocation(program, 'u_texture');
+
+    // Create and bind VAO once
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    // Define interleaved vertex data (position and texCoord)
+    const vertices = new Float32Array([
+        // Position    // TexCoord
+        -1, -1,       0, 0,
+         1, -1,       1, 0,
+        -1,  1,       0, 1,
+        -1,  1,       0, 1,
+         1, -1,       1, 0,
+         1,  1,       1, 1,
+    ]);
+
+    // Create and setup vertex buffer
+    const vertexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+
+    const stride = 4 * Float32Array.BYTES_PER_ELEMENT; // 4 floats per vertex
+
+    // Set up position attribute
+    gl.enableVertexAttribArray(positionAttributeLocation);
+    gl.vertexAttribPointer(
+        positionAttributeLocation,
+        2,
+        gl.FLOAT,
+        false,
+        stride,
+        0
+    );
+
+    // Set up texCoord attribute
+    gl.enableVertexAttribArray(texCoordAttributeLocation);
+    gl.vertexAttribPointer(
+        texCoordAttributeLocation,
+        2,
+        gl.FLOAT,
+        false,
+        stride,
+        2 * Float32Array.BYTES_PER_ELEMENT
+    );
+
+    // Create and setup texture
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    
+    // Allocate immutable texture storage using texStorage2D
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, CANVAS_SIZE, CANVAS_SIZE);
+
+    // Initialize texture data efficiently
+    const initialData = new Uint8Array(CANVAS_SIZE * CANVAS_SIZE * 4).fill(255); // White canvas
+    gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        0,
+        CANVAS_SIZE,
+        CANVAS_SIZE,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        initialData
+    );
+
+    // Set texture parameters once
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+    // Unbind VAO and texture to avoid accidental modifications
+    gl.bindVertexArray(null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    // Initialize pixelData
+    const pixelData = new Uint8Array(initialData);
+
+    // Initial render
+    renderCanvas(gl, program, vao, texture, textureUniformLocation);
+
+    return {
+        gl,
+        program,
+        vao,
+        texture,
+        textureUniformLocation,
+        pixelData,
+        needsUpdate: false, // Initialize with no updates needed
+        updateQueue: [] // Queue to accumulate pixel updates
+    };
+}
+
+// State cache to minimize WebGL state changes (removed global cache)
+
+// Rendering Loop to Batch Texture Updates
+function renderLoop() {
+    canvases.forEach(canvasObj => {
+        if (canvasObj.needsUpdate && canvasObj.updateQueue.length > 0) {
+            updateTexture(canvasObj);
+        }
+    });
+
+    requestAnimationFrame(renderLoop);
+}
+
+// Update the texture with new pixel data from the queue
+function updateTexture(canvasObj) {
+    const { gl, texture, pixelData, program, vao, textureUniformLocation, updateQueue } = canvasObj;
+
+    // Debug: Log number of updates
+    console.log(`Updating texture for canvas ${canvasObj.id} with ${updateQueue.length} pixels`);
+
+    // Process all queued updates
+    updateQueue.forEach(pixel => {
+        const { x, y, color } = pixel;
+        if (!isWithinCanvas(x, y, canvasObj)) return;
+
+        const rgba = hexToRgba(color);
+        const index = (y * CANVAS_SIZE + x) * 4;
+        pixelData.set([rgba.r, rgba.g, rgba.b, 255], index);
+    });
+
+    // Clear the update queue after processing
+    canvasObj.updateQueue = [];
+
+    // Update the texture using texSubImage2D
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        0,
+        CANVAS_SIZE,
+        CANVAS_SIZE,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        pixelData
+    );
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    // Render the updated texture
+    renderCanvas(gl, program, vao, texture, textureUniformLocation);
+}
+
+// Render the texture onto the canvas
+function renderCanvas(gl, program, vao, texture, textureUniformLocation) {
+    gl.viewport(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+    gl.clearColor(1, 1, 1, 1); // Clear to white
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // Use program
+    gl.useProgram(program);
+
+    // Bind VAO
+    gl.bindVertexArray(vao);
+
+    // Bind texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(textureUniformLocation, 0);
+
+    // Draw
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Unbind VAO and texture to clean up
+    gl.bindVertexArray(null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.useProgram(null);
+}
+
+// Create a canvas wrapper and initialize WebGL
 function createCanvasWrapper(x, y, alreadyLoaded = false) {
     const canvasId = generateCanvasId(x, y);
 
@@ -732,7 +787,6 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
     canvas.height = CANVAS_SIZE;
     wrapper.appendChild(canvas);
 
-    // Add arrow buttons for adding neighboring canvases
     ['up', 'down', 'left', 'right'].forEach(direction => {
         const arrow = document.createElement('button');
         arrow.classList.add('arrow', direction);
@@ -744,113 +798,36 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
 
     canvasMap.appendChild(wrapper);
 
-    const ctx = canvas.getContext('2d');
-    ctx.imageSmoothingEnabled = false;
+    const glObjects = initializeWebGL(canvas);
+    if (!glObjects) {
+        console.error(`Failed to initialize WebGL2 for canvas ${canvasId}`);
+        return;
+    }
 
     const canvasObj = {
         id: canvasId,
         x,
         y,
         canvas,
-        ctx,
-        canvasData: {},
+        gl: glObjects.gl,
+        program: glObjects.program,
+        vao: glObjects.vao,
+        texture: glObjects.texture,
+        pixelData: glObjects.pixelData,
+        needsUpdate: false, // Initially, no updates needed
+        updateQueue: [], // Initialize empty update queue
         rendered: true
     };
 
     canvases.set(canvasId, canvasObj);
     socket.emit('join-canvas', { canvasId });
-// Initialize canvas data from server
-socket.on('init-canvas', async (data) => {
-    if (data.canvasId === canvasId) {
-        const newCanvasData = data.canvasData || [];
-        const canvasWidth = CANVAS_SIZE; // Assuming square canvas
-        const canvasHeight = CANVAS_SIZE;
-        let processed = new Set(); // Keep track of processed pixels
 
-        // Helper function to find the largest rectangle of contiguous color starting from (x, y)
-        const findRectangle = (startX, startY, color) => {
-            let endX = startX;
-            let endY = startY;
+    // Note: Removed socket.on('init-canvas') from here
 
-            // Extend rectangle horizontally as long as the color matches
-            while (endX < canvasWidth && newCanvasData[startY * canvasWidth + endX]?.color === color && !processed.has(startY * canvasWidth + endX)) {
-                endX++;
-            }
-
-            // Extend rectangle vertically, but only as long as all pixels in the row match the same color
-            let validHeight = true;
-            while (endY < canvasHeight && validHeight) {
-                for (let x = startX; x < endX; x++) {
-                    if (newCanvasData[endY * canvasWidth + x]?.color !== color || processed.has(endY * canvasWidth + x)) {
-                        validHeight = false;
-                        break;
-                    }
-                }
-                if (validHeight) endY++;
-            }
-
-            // Mark all pixels in this rectangle as processed
-            for (let y = startY; y < endY; y++) {
-                for (let x = startX; x < endX; x++) {
-                    processed.add(y * canvasWidth + x);
-                }
-            }
-
-            return { endX, endY };
-        };
-
-        // Helper function to draw a rectangle of contiguous color
-        const drawRectangle = (startX, startY, endX, endY, color) => {
-            const width = endX - startX;
-            const height = endY - startY;
-            ctx.fillStyle = color;
-            ctx.fillRect(startX, startY, width, height);
-        };
-
-        // Process the entire canvas to find and draw rectangles of the same color
-        const fillCanvasAsync = async () => {
-            for (let py = 0; py < canvasHeight; py++) {
-                for (let px = 0; px < canvasWidth; px++) {
-                    const index = py * canvasWidth + px;
-                    const currentColor = newCanvasData[index]?.color || '#FFFFFF'; // Default to white
-
-                    // If this pixel has not been processed, find the largest rectangle
-                    if (!processed.has(index)) {
-                        const { endX, endY } = findRectangle(px, py, currentColor);
-                        drawRectangle(px, py, endX, endY, currentColor);
-                    }
-
-                    // Update pixel data if it's new or changed
-                    if (!canvasObj.canvasData[index] || canvasObj.canvasData[index].color !== currentColor) {
-                        canvasObj.canvasData[index] = {
-                            color: currentColor,
-                            user: newCanvasData[index]?.user || null,
-                            timestamp: newCanvasData[index]?.timestamp || Date.now()
-                        };
-                    }
-                }
-
-            }
-
-            // Update the canvas object data
-            canvasObj.canvasData = new Set(newCanvasData);
-            loadingIndicator.style.display = 'none';
-            updateArrowsVisibility(x, y);
-        };
-
-        // Start asynchronous filling of the canvas with grouped drawing
-        fillCanvasAsync();
-    }
-});
-
+    return wrapper;
 }
 
-/**
- * Handles arrow button clicks to add neighboring canvases.
- * @param {number} currentX 
- * @param {number} currentY 
- * @param {string} direction 
- */
+// Handle arrow button clicks to add new canvases
 function handleArrowClick(currentX, currentY, direction) {
     if (!isAuthenticated) return;
 
@@ -875,30 +852,17 @@ function handleArrowClick(currentX, currentY, direction) {
     createCanvasWrapper(newX, newY);
 }
 
-/**
- * Capitalizes the first letter of a string.
- * @param {string} str 
- * @returns {string}
- */
+// Capitalize first letter
 function capitalize(str) {
     return str.charAt(0).toUpperCase() + str.slice(1);
 }
 
-/**
- * Generates a canvas ID based on coordinates.
- * @param {number} x 
- * @param {number} y 
- * @returns {string}
- */
+// Generate canvas ID from coordinates
 function generateCanvasId(x, y) {
     return `${x}|${y}`;
 }
 
-/**
- * Updates the visibility of arrow buttons based on neighboring canvases.
- * @param {number} x 
- * @param {number} y 
- */
+// Update the visibility of canvas arrows based on existing neighbors
 function updateArrowsVisibility(x, y) {
     const directions = ['up', 'down', 'left', 'right'];
     directions.forEach(direction => {
@@ -913,40 +877,34 @@ function updateArrowsVisibility(x, y) {
 
 // Pan and Zoom Handling
 
-/**
- * Initializes pan and zoom functionalities.
- */
 function initPanAndZoom() {
     let isMouseDownPan = false;
     let lastMousePosition = { x: 0, y: 0 };
     let keysPressed = {};
-	let isSpacePressed = false;
+    let isSpacePressed = false;
 
-    // Mouse Event Listeners for Panning with Middle Button and Space + Drag
     document.addEventListener('mousedown', (e) => {
-        if (e.button === 1 || (e.button === 0 && isSpacePressed)) { // Middle button or Space + Left Click
+        if (e.button === 1 || (e.button === 0 && isSpacePressed)) {
             e.preventDefault();
-			console.log("Panning");
             isPanning = true;
             isMouseDownPan = true;
             disableDrawing = true;
             lastMousePosition = { x: e.clientX, y: e.clientY };
             canvasMap.classList.add('grabbing');
         }
-
     });
 
     document.addEventListener('mousemove', (e) => {
         if (isPanning && isMouseDownPan){
-			const deltaX = e.clientX - lastMousePosition.x;
-			const deltaY = e.clientY - lastMousePosition.y;
-			pan(deltaX, deltaY);
-		}
+            const deltaX = e.clientX - lastMousePosition.x;
+            const deltaY = e.clientY - lastMousePosition.y;
+            pan(deltaX, deltaY);
+        }
         lastMousePosition = { x: e.clientX, y: e.clientY };
     });
 
     document.addEventListener('mouseup', (e) => {
-        if ((isPanning && e.button === 1) || (isPanning && e.button === 0 && isSpacePressed)) { // Middle button release or Space + Left Click release
+        if ((isPanning && e.button === 1) || (isPanning && e.button === 0 && isSpacePressed)) {
             isPanning = false;
             isMouseDownPan = false;
             disableDrawing = false;
@@ -954,90 +912,74 @@ function initPanAndZoom() {
         }
     });
 
-	// allow simulating touch events by pinning a point with alt and then dragging
+    document.addEventListener('touchstart', touchStart, { passive: false });
 
-	document.addEventListener('touchstart', touchStart);
+    function touchStart (e) {
+        if (e.touches.length === 2) {
+            e.preventDefault(); // Prevent default pinch-to-zoom
+            const touch1 = e.touches[0];
+            const touch2 = e.touches[1];
+            const touchCenter = {
+                x: (touch1.clientX + touch2.clientX) / 2,
+                y: (touch1.clientY + touch2.clientY) / 2
+            };
+            lastMousePosition = { x: touchCenter.x, y: touchCenter.y };
+        }
+    }
 
-	function touchStart (e) {
-		if (e.touches.length === 2) {
-			const touch1 = e.touches[0];
-			const touch2 = e.touches[1];
-			const touchCenter = {
-				x: (touch1.clientX + touch2.clientX) / 2,
-				y: (touch1.clientY + touch2.clientY) / 2
-			};
-			lastMousePosition = { x: touchCenter.x, y: touchCenter.y };
-		}
-	}
+    let lastPinchDistance = -1;
 
-	var lastPinchDistance = -1;
+    document.addEventListener('touchmove', touchMove, { passive: false });
 
-	document.addEventListener('touchmove', touchMove);
+    function touchMove (e) {
+        if (e.touches.length === 2) {
+            e.preventDefault(); // Prevent default pinch-to-zoom
+            const touch1 = e.touches[0];
+            const touch2 = e.touches[1];
+            const touchCenter = {
+                x: (touch1.clientX + touch2.clientX) / 2,
+                y: (touch1.clientY + touch2.clientY) / 2
+            };
+            const deltaX = touchCenter.x - lastMousePosition.x;
+            const deltaY = touchCenter.y - lastMousePosition.y;
+            pan(deltaX, deltaY);
+            lastMousePosition = { x: touchCenter.x, y: touchCenter.y };
 
+            const distance = Math.hypot(touch1.clientX - touch2.clientX, touch1.clientY - touch2.clientY);
+            if (lastPinchDistance === -1) {
+                lastPinchDistance = distance;
+            }
 
+            const pinchChange = distance - lastPinchDistance;
+            const rect = canvasMap.getBoundingClientRect();
+            const mouseX = touchCenter.x - rect.left;
+            const mouseY = touchCenter.y - rect.top;
+            const scaleFactor = 0.005;
+            const wheel = pinchChange;
 
-	function touchMove (e) {
-		console.log(e.touches.length)
-		if (e.touches.length === 2) {
-			console.log("Panning");
-			const touch1 = e.touches[0];
-			const touch2 = e.touches[1];
-			const touchCenter = {
-				x: (touch1.clientX + touch2.clientX) / 2,
-				y: (touch1.clientY + touch2.clientY) / 2
-			};
-			const deltaX = touchCenter.x - lastMousePosition.x;
-			const deltaY = touchCenter.y - lastMousePosition.y;
-			pan(deltaX, deltaY);
-			lastMousePosition = { x: touchCenter.x, y: touchCenter.y };
+            let newZoom = currentZoom * (1 + wheel * scaleFactor);
+            newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
+            const zoomChangeFactor = newZoom / currentZoom;
 
-			const distance = Math.hypot(touch1.clientX - touch2.clientX, touch1.clientY - touch2.clientY);
-			if (lastPinchDistance === -1) {
-				lastPinchDistance = distance;
-			}
+            currentPan.x -= mouseX * (zoomChangeFactor - 1);
+            currentPan.y -= mouseY * (zoomChangeFactor - 1);
 
-			const pinchChange = distance - lastPinchDistance;
-			// zoom on the center of the pinch, make sure we zoom faster if the pinch distance is larger
-			const rect = canvasMap.getBoundingClientRect();
-			const mouseX = touchCenter.x - rect.left;
-			const mouseY = touchCenter.y - rect.top;
-			const scaleFactor = 0.005; // Control zoom speed here
-			const wheel = pinchChange
+            currentZoom = newZoom;
+            updateCanvasMapTransform();
 
-			// Apply exponential scaling for smoother zoom
-			let newZoom = currentZoom * (1 + wheel * scaleFactor);
+            lastPinchDistance = distance;
+        }
+    }
 
-			// Keep zoom within bounds
-			newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
-			const zoomChange = newZoom / currentZoom;
+    document.addEventListener('touchend', touchEnd, { passive: false });
 
-			// Adjust panning to keep the mouse position in the same place
-			currentPan.x -= mouseX * (zoomChange - 1);
-			currentPan.y -= mouseY * (zoomChange - 1);
+    function touchEnd (e) {
+        if (e.touches.length < 2) {
+            isPanning = false;
+            lastPinchDistance = -1;
+        }
+    }
 
-			currentZoom = newZoom;
-
-			
-		
-			updateCanvasMapTransform();
-
-			lastPinchDistance = distance;
-
-		}
-	}
-
-	document.addEventListener('touchend', touchEnd);
-
-	function touchEnd (e) {
-		if (e.touches.length < 2) {
-			isPanning = false;
-			pinnedPoint = null;
-			lastPinchDistance = -1;
-		}
-	}
-
-
-    // Keyboard Event Listeners for Panning with WASD and Arrow Keys
     document.addEventListener('keydown', (e) => {
         if (['w', 'a', 's', 'd', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight'].includes(e.key)) {
             e.preventDefault();
@@ -1047,7 +989,7 @@ function initPanAndZoom() {
             e.preventDefault();
             disableDrawing = true;
             canvasMap.classList.add('grabbing');
-			isSpacePressed = true;
+            isSpacePressed = true;
         }
     });
 
@@ -1058,38 +1000,30 @@ function initPanAndZoom() {
         if (e.code === 'Space') {
             disableDrawing = false;
             canvasMap.classList.remove('grabbing');
-			isSpacePressed = false;
+            isSpacePressed = false;
         }
     });
 
-    // Mouse Wheel for Zooming
     document.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const rect = canvasMap.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
 
-		e.preventDefault();
-		const rect = canvasMap.getBoundingClientRect();
-		const mouseX = e.clientX - rect.left;
-		const mouseY = e.clientY - rect.top;
-	
-		const scaleFactor = 0.1; // Control zoom speed here
-		const wheel = e.deltaY < 0 ? 1 : -1;
-		
-		// Apply exponential scaling for smoother zoom
-		let newZoom = currentZoom * (1 + wheel * scaleFactor);
-	
-		// Keep zoom within bounds
-		newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
-		const zoomChange = newZoom / currentZoom;
-	
-		// Adjust panning to keep the mouse position in the same place
-		currentPan.x -= mouseX * (zoomChange - 1);
-		currentPan.y -= mouseY * (zoomChange - 1);
-	
-		currentZoom = newZoom;
-		updateCanvasMapTransform();
+        const scaleFactor = 0.1;
+        const wheelDirection = e.deltaY < 0 ? 1 : -1;
 
+        let newZoom = currentZoom * (1 + wheelDirection * scaleFactor);
+        newZoom = Math.min(Math.max(newZoom, MIN_ZOOM), MAX_ZOOM);
+        const zoomChangeFactor = newZoom / currentZoom;
+
+        currentPan.x -= mouseX * (zoomChangeFactor - 1);
+        currentPan.y -= mouseY * (zoomChangeFactor - 1);
+
+        currentZoom = newZoom;
+        updateCanvasMapTransform();
     }, { passive: false });
 
-    // Smooth Panning with Keyboard
     function smoothPan() {
         if (keysPressed['w'] || keysPressed['ArrowUp']) pan(0, PAN_SPEED);
         if (keysPressed['s'] || keysPressed['ArrowDown']) pan(0, -PAN_SPEED);
@@ -1097,25 +1031,16 @@ function initPanAndZoom() {
         if (keysPressed['d'] || keysPressed['ArrowRight']) pan(-PAN_SPEED, 0);
         requestAnimationFrame(smoothPan);
     }
-	
+
     smoothPan();
 
-    /**
-     * Pans the canvas map by the specified deltas.
-     * @param {number} deltaX 
-     * @param {number} deltaY 
-     */
     function pan(deltaX, deltaY) {
         currentPan.x += deltaX;
         currentPan.y += deltaY;
         updateCanvasMapTransform();
     }
-
 }
 
-/**
- * Updates the transformation of the canvas map based on pan and zoom.
- */
 function updateCanvasMapTransform() {
     canvasMap.style.transform = `translate(${currentPan.x}px, ${currentPan.y}px) scale(${currentZoom})`;
     updateVisibleCanvases();
@@ -1123,24 +1048,25 @@ function updateCanvasMapTransform() {
 
 // Canvas Management
 
-/**
- * Initializes the canvas map on page load.
- */
 window.onload = () => {
     fetchAuthStatus();
 
-    // Prevent native pinch-to-zoom and other default behaviors
+    socket.on('connect', () => {
+        clientId = socket.id;
+        console.log('Connected to socket.io with ID:', clientId);
+    });
+
+    // Prevent default gestures and double-clicks
     ['gesturestart', 'gesturechange', 'gestureend', 'touchmove', 'dblclick'].forEach(event => {
         document.addEventListener(event, (e) => e.preventDefault(), { passive: false });
     });
 
-    // Initialize pan and zoom functionalities
     initPanAndZoom();
 
-    // Request initial canvas list from server
     socket.emit('request-canvas-list');
 
     socket.on('update-canvas-list', async ({ canvasList }) => {
+        console.log('Received canvas list:', canvasList);
         canvasList.forEach(canvasId => {
             const [x, y] = canvasId.split('|').map(Number);
             createCanvasWrapper(x, y);
@@ -1153,19 +1079,52 @@ window.onload = () => {
         updateVisibleCanvases();
     });
 
-    // Handle incoming draw-pixel events
-    socket.on('draw', async (data) => {
-        const { canvasId, x, y, color, size, tool, extra_data, user, timestamp } = data;
+    // Moved 'init-canvas' listener outside 'createCanvasWrapper'
+    socket.on('init-canvas', async (data) => {
+        const { canvasId, canvasData } = data;
+        console.log(`Initializing canvas ${canvasId} with data:`, canvasData);
+
         const canvasObj = canvases.get(canvasId);
-        if (!canvasObj) return;
+        if (!canvasObj) {
+            console.warn(`Received init-canvas for unknown canvasId: ${canvasId}`);
+            return;
+        }
 
-        canvasObj.ctx.fillStyle = color;
-        canvasObj.ctx.imageSmoothingEnabled = false;
+        // Update pixelData
+        for (let py = 0; py < CANVAS_SIZE; py++) {
+            for (let px = 0; px < CANVAS_SIZE; px++) {
+                const index = (py * CANVAS_SIZE + px) * 4;
+                const pixel = canvasData[py * CANVAS_SIZE + px];
+                const color = pixel?.color || '#FFFFFF';
+                const rgba = hexToRgba(color);
+                canvasObj.pixelData.set([rgba.r, rgba.g, rgba.b, 255], index);
+            }
+        }
 
-        
-        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId, user);
-     
+        canvasObj.needsUpdate = true; // Flag for initial texture update
+        // The rendering loop will handle the texture update
     });
+
+    socket.on('update-canvas', async (data) => {
+        const { canvasId, updatedPixels } = data;
+    
+        const canvasObj = canvases.get(canvasId);
+        if (!canvasObj) {
+            console.warn(`Received update-canvas for unknown canvasId: ${canvasId}`);
+            return;
+        }
+
+        // Accumulate pixel updates
+        updatedPixels.forEach(pixel => {
+            const { x, y, color } = pixel;
+            canvasObj.updateQueue.push({ x, y, color });
+        });
+
+        canvasObj.needsUpdate = true; // Flag to update in rendering loop
+    });
+
+    // Initialize rendering loop
+    requestAnimationFrame(renderLoop);
 };
 
 // Prevent Ctrl + Zoom on Desktop
