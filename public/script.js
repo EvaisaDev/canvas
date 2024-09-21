@@ -283,46 +283,81 @@ function drawPixel(canvasObj, x, y, color, targetColor = null, username = "unkno
  * @param {string} canvasId - ID of the canvas
  */
 function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null, username = "unknown") {
-    ctx.fillStyle = color;
     const radius = size / 2;
     const center = radius - 0.5;
-	// get canvas
-	const canvasObj = canvases.get(canvasId);
-	if (!canvasObj) return;
+    const canvasObj = canvases.get(canvasId);
+    if (!canvasObj) return;
 
-    for (let yOffset = 0; yOffset < size; yOffset++) {
-        for (let xOffset = 0; xOffset < size; xOffset++) {
-            const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
-            if (distance < radius) {
+    const CHUNK_SIZE = 500; // Adjust chunk size for brush strokes
+    let allPixels = [];
 
-				if (targetColor == null) {
-                	ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
-					// set pixel data
-					const key = `${x + xOffset - radius + 1},${y + yOffset - radius + 1}`;
-					const pixelData = { color, user: username, timestamp: Date.now() };
-					canvasObj.canvasData[key] = pixelData;
-				} else {
-					// only draw if the pixel is the target color
-					if (getPixelColor(ctx, x + xOffset - radius + 1, y + yOffset - radius + 1) == targetColor) {
-						ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
-						// set pixel data
-						const key = `${x + xOffset - radius + 1},${y + yOffset - radius + 1}`;
-						const pixelData = { color, user: username, timestamp: Date.now() };
-						canvasObj.canvasData[key] = pixelData;
-						
-					}
-				}
+    // Function to process a chunk of pixels
+    const processChunk = async (chunk) => {
+        for (let i = 0; i < chunk.length; i++) {
+            const { xOffset, yOffset } = chunk[i];
+
+			ctx.fillStyle = color;
+            if (targetColor == null || getPixelColor(ctx, x + xOffset - radius + 1, y + yOffset - radius + 1) === targetColor) {
+                ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
+
+                const key = `${x + xOffset - radius + 1},${y + yOffset - radius + 1}`;
+                const pixelData = { color, user: username, timestamp: Date.now() };
+                canvasObj.canvasData[key] = pixelData;
             }
         }
-    }
+    };
+
+    // randomize
+	const distanceSort = (a, b) => Math.random() - 0.5;
+
+    // Asynchronously draw pixels in chunks
+    const drawPixelsAsync = async () => {
+        for (let yOffset = 0; yOffset < size; yOffset++) {
+            for (let xOffset = 0; xOffset < size; xOffset++) {
+                const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
+                if (distance < radius) {
+                    allPixels.push({ xOffset, yOffset });
+                }
+            }
+        }
+
+		// Sort pixels by distance from center
+		allPixels.sort(distanceSort);
+
+
+        // Process shuffled pixels in chunks
+        while (allPixels.length > 0) {
+            const chunk = allPixels.splice(0, CHUNK_SIZE);
+            await processChunk(chunk);
+
+            // Yield back to the browser to avoid blocking
+            await new Promise(resolve => {
+                requestIdleCallback ? requestIdleCallback(resolve) : setTimeout(resolve, 0);
+            });
+        }
+    };
+
+    // Start asynchronous pixel drawing with chunked and shuffled drawing
+    drawPixelsAsync();
 }
 
-function getPixelColor(ctx, x, y) {
+
+
+function getPixelColor(ctx, x, y, pixelDataCache = null) {
     if (!ctx) return '#FFFFFF';
+    
+    // Use cached pixel data if available
+    if (pixelDataCache) {
+        const index = (y * ctx.canvas.width + x) * 4;
+        const r = pixelDataCache[index];
+        const g = pixelDataCache[index + 1];
+        const b = pixelDataCache[index + 2];
+        return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
+    }
 
     try {
         const pixelData = ctx.getImageData(x, y, 1, 1).data;
-        return `#${((1 << 24) + (pixelData[0] << 16) + (pixelData[1] << 8) + pixelData[2]).toString(16).slice(1)}`;
+        return `#${((1 << 24) + (pixelData[0] << 16) + (pixelData[1] << 8) + pixelData[2]).toString(16).slice(1).toUpperCase()}`;
     } catch (error) {
         console.error('Error getting pixel color:', error);
         return '#FFFFFF';
@@ -443,7 +478,11 @@ function handleMouseUp(e) {
     if (!isDrawing) return;
 	if(e.target.closest == undefined) return
     const targetCanvasWrapper = e.target.closest('.canvas-wrapper');
-    if (!targetCanvasWrapper || !currentCanvasObj) return;
+    if (!targetCanvasWrapper || !currentCanvasObj) {
+		const tool = tools[currentTool];
+        tool?.onMouseUp(e, null);
+		return;
+	}
 
     const x = Number(targetCanvasWrapper.getAttribute('data-x'));
     const y = Number(targetCanvasWrapper.getAttribute('data-y'));
@@ -743,35 +782,60 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
     socket.emit('join-canvas', { canvasId });
 
     // Initialize canvas data from server
-    socket.on('init-canvas', async (data) => {
-        if (data.canvasId === canvasId) {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            ctx.fillStyle = '#FFFFFF';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            const canvasData = data.canvasData || {};
-            /*Object.keys(canvasData).forEach(key => {
-                const [px, py] = key.split(',').map(Number);
-                ctx.fillStyle = canvasData[key].color;
-                ctx.fillRect(px, py, 1, 1);
-            });
-			*/
-
-			console.log(data.imageBlob);
-
-			const imageBlob = data.imageBlob;
+	socket.on('init-canvas', async (data) => {
+		if (data.canvasId === canvasId) {
+			const newCanvasData = data.canvasData || {};
 			
-			const image = new Image();
-			image.onload = () => {
-				console.log("Image loaded");
-				ctx.drawImage(image, 0, 0);
+			const CHUNK_SIZE = 1000; // Adjust the chunk size to balance performance and responsiveness
+			const pixelKeys = Object.keys(newCanvasData);
+			let currentChunk = [];
+	
+			// Function to process a chunk of pixels
+			const processChunk = async () => {
+				for (let i = 0; i < currentChunk.length; i++) {
+					const key = currentChunk[i];
+					const [px, py] = key.split(',').map(Number);
+					const newColor = newCanvasData[key].color;
+	
+					// Only redraw pixels if the color has changed
+					if (canvasObj.canvasData[key] && canvasObj.canvasData[key].color !== newColor) {
+						ctx.fillStyle = newColor;
+						ctx.fillRect(px, py, 1, 1);
+					} else if (!canvasObj.canvasData[key]) {
+						// If the pixel is new, draw it
+						ctx.fillStyle = newColor;
+						ctx.fillRect(px, py, 1, 1);
+					}
+				}
 			};
-			image.src = URL.createObjectURL(new Blob([imageBlob]));
-			
-            canvasObj.canvasData = canvasData;
-            loadingIndicator.style.display = 'none';
-            updateArrowsVisibility(x, y);
-        }
-    });
+	
+			// Asynchronously fill the canvas with data in chunks
+			const fillCanvasAsync = async () => {
+				for (let i = 0; i < pixelKeys.length; i++) {
+					currentChunk.push(pixelKeys[i]);
+	
+					// Once we've gathered enough pixels, process the chunk
+					if (currentChunk.length >= CHUNK_SIZE || i === pixelKeys.length - 1) {
+						await processChunk();  // Process the chunk
+						currentChunk = [];     // Reset chunk
+	
+						// Yield back to the browser to avoid blocking
+						await new Promise(resolve => {
+							requestIdleCallback ? requestIdleCallback(resolve) : setTimeout(resolve, 0);
+						});
+					}
+				}
+	
+				// Update the canvas object data
+				canvasObj.canvasData = { ...canvasObj.canvasData, ...newCanvasData };
+				loadingIndicator.style.display = 'none';
+				updateArrowsVisibility(x, y);
+			};
+	
+			// Start asynchronous filling of the canvas with chunked drawing
+			fillCanvasAsync();
+		}
+	});
 }
 
 /**
