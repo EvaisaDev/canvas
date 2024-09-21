@@ -102,7 +102,7 @@ class DrawingTool extends Tool {
     plotPoint(canvasObj, x, y, drawColor) {
         // Plot within current canvas
         const adjustedColor = this.isEraser ? '#FFFFFF' : drawColor;
-        drawPixel(canvasObj, x, y, adjustedColor, this.extra_data.targetColor, userInfo);
+        drawPixel(canvasObj, x, y, adjustedColor, userInfo);
 
         // Emit draw event
         socket.emit('draw', {
@@ -146,7 +146,7 @@ class MarkerTool extends DrawingTool {
 
 
 
-		const targetColor = getPixelColor(canvasObj.ctx, x, y);
+		const targetColor = getPixelColor(canvasObj, x, y);
 		this.extra_data.targetColor = targetColor;
         const drawColor = this.isEraser ? '#FFFFFF' : currentColor;
         this.plotPoint(canvasObj, x, y, drawColor);
@@ -161,7 +161,7 @@ class ColorPickerTool extends Tool {
 
     onMouseDown(e, canvasObj) {
         const { x, y } = getCanvasCoordinates(e, canvasObj);
-        const color = getPixelColor(canvasObj.ctx, x, y);
+        const color = getPixelColor(canvasObj, x, y);
         currentColor = color;
         updateColorSwatches(color);
     }
@@ -265,16 +265,16 @@ function getNeighborCanvasId(currentId, direction) {
  * @param {number} y - Y-coordinate
  * @param {string} color - Color to draw
  */
-function drawPixel(canvasObj, x, y, color, targetColor = null, username = "unknown") {
+function drawPixel(canvasObj, x, y, color, username = "unknown") {
     const ctx = canvasObj.ctx;
     ctx.fillStyle = color;
     ctx.imageSmoothingEnabled = false;
 
-    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id, targetColor, username);
+    drawBrush(ctx, x, y, Math.floor(pencilSize), color, canvasObj.id, username);
 }
 
 /**
- * Draws a circular brush with configurable pixel size.
+ * Draws a circular brush with configurable pixel size, optimized by reducing the number of fillRect calls.
  * @param {CanvasRenderingContext2D} ctx - Canvas context
  * @param {number} x - X-coordinate
  * @param {number} y - Y-coordinate
@@ -282,86 +282,65 @@ function drawPixel(canvasObj, x, y, color, targetColor = null, username = "unkno
  * @param {string} color - Color to draw
  * @param {string} canvasId - ID of the canvas
  */
-function drawBrush(ctx, x, y, size, color, canvasId, targetColor = null, username = "unknown") {
+function drawBrush(ctx, x, y, size, color, canvasId, username = "unknown") {
     const radius = size / 2;
     const center = radius - 0.5;
     const canvasObj = canvases.get(canvasId);
     if (!canvasObj) return;
 
-    const CHUNK_SIZE = 500; // Adjust chunk size for brush strokes
-    let allPixels = [];
+	ctx.imageSmoothingEnabled = false;
+    
+    // Function to draw squares efficiently
+    function drawSquare(x, y, width, height) {
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, width, height);
 
-    // Function to process a chunk of pixels
-    const processChunk = async (chunk) => {
-        for (let i = 0; i < chunk.length; i++) {
-            const { xOffset, yOffset } = chunk[i];
+        const pixelData = { color, user: username, timestamp: Date.now() };
+        let index = (y * CANVAS_SIZE) + x;
 
-			ctx.fillStyle = color;
-            if (targetColor == null || getPixelColor(ctx, x + xOffset - radius + 1, y + yOffset - radius + 1) === targetColor) {
-                ctx.fillRect(x + xOffset - radius + 1, y + yOffset - radius + 1, 1, 1);
-
-                const key = `${x + xOffset - radius + 1},${y + yOffset - radius + 1}`;
-                const pixelData = { color, user: username, timestamp: Date.now() };
-                canvasObj.canvasData[key] = pixelData;
+        if (canvasObj.canvasData === undefined) {
+            canvasObj.canvasData = new Set();
+            for (let i = 0; i < CANVAS_SIZE * CANVAS_SIZE; i++) {
+                canvasObj.canvasData.add({ color: "#FFFFFF", user: null, timestamp: 0 });
             }
         }
-    };
+        canvasObj.canvasData[index] = pixelData;
+    }
 
-    // randomize
-	const distanceSort = (a, b) => Math.random() - 0.5;
+    // Loop over the brush area
+    for (let yOffset = 0; yOffset < size; yOffset++) {
+        for (let xOffset = 0; xOffset < size; xOffset++) {
+            const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
+            if (distance < radius) {
+                // Try to fill the largest possible square that fits in the circle
 
-    // Asynchronously draw pixels in chunks
-    const drawPixelsAsync = async () => {
-        for (let yOffset = 0; yOffset < size; yOffset++) {
-            for (let xOffset = 0; xOffset < size; xOffset++) {
-                const distance = Math.sqrt(Math.pow(xOffset - center, 2) + Math.pow(yOffset - center, 2));
-                if (distance < radius) {
-                    allPixels.push({ xOffset, yOffset });
+                // Determine the largest square that can be packed inside the current area
+                let squareSize = 1;
+                while (distance + squareSize - 1 < radius && xOffset + squareSize <= size && yOffset + squareSize <= size) {
+                    squareSize++;
                 }
+                squareSize--; // Reduce to fit inside the circle
+
+                // Draw the square
+                drawSquare(x + xOffset - radius + 1, y + yOffset - radius + 1, squareSize, squareSize);
+
+                // Skip the pixels that were filled by the square
+                xOffset += squareSize - 1;
             }
         }
-
-		// Sort pixels by distance from center
-		allPixels.sort(distanceSort);
-
-
-        // Process shuffled pixels in chunks
-        while (allPixels.length > 0) {
-            const chunk = allPixels.splice(0, CHUNK_SIZE);
-            await processChunk(chunk);
-
-            // Yield back to the browser to avoid blocking
-            await new Promise(resolve => {
-                requestIdleCallback ? requestIdleCallback(resolve) : setTimeout(resolve, 0);
-            });
-        }
-    };
-
-    // Start asynchronous pixel drawing with chunked and shuffled drawing
-    drawPixelsAsync();
+    }
 }
 
 
 
-function getPixelColor(ctx, x, y, pixelDataCache = null) {
-    if (!ctx) return '#FFFFFF';
-    
-    // Use cached pixel data if available
-    if (pixelDataCache) {
-        const index = (y * ctx.canvas.width + x) * 4;
-        const r = pixelDataCache[index];
-        const g = pixelDataCache[index + 1];
-        const b = pixelDataCache[index + 2];
-        return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
-    }
+function getPixelColor(canvasObj, x, y) {
+	var key = (y * CANVAS_SIZE) + x;
 
-    try {
-        const pixelData = ctx.getImageData(x, y, 1, 1).data;
-        return `#${((1 << 24) + (pixelData[0] << 16) + (pixelData[1] << 8) + pixelData[2]).toString(16).slice(1).toUpperCase()}`;
-    } catch (error) {
-        console.error('Error getting pixel color:', error);
-        return '#FFFFFF';
-    }
+	if (canvasObj.canvasData[key]) {
+		return canvasObj.canvasData[key].color;
+	} else {
+		return "#FFFFFF";
+	}
 }
 
 /**
@@ -545,7 +524,7 @@ canvasMap.addEventListener('mousemove', (e) => {
     }
 
     const { x: pixelX, y: pixelY } = getCanvasCoordinates(e, canvasObj);
-    const key = `${pixelX},${pixelY}`;
+    const key = (pixelY * CANVAS_SIZE) + pixelX;
     const pixelData = canvasObj.canvasData?.[key] || null;
 
     const currentHoveredPixel = { canvasId, x: pixelX, y: pixelY };
@@ -780,62 +759,90 @@ function createCanvasWrapper(x, y, alreadyLoaded = false) {
 
     canvases.set(canvasId, canvasObj);
     socket.emit('join-canvas', { canvasId });
+// Initialize canvas data from server
+socket.on('init-canvas', async (data) => {
+    if (data.canvasId === canvasId) {
+        const newCanvasData = data.canvasData || [];
+        const canvasWidth = CANVAS_SIZE; // Assuming square canvas
+        const canvasHeight = CANVAS_SIZE;
+        let processed = new Set(); // Keep track of processed pixels
 
-    // Initialize canvas data from server
-	socket.on('init-canvas', async (data) => {
-		if (data.canvasId === canvasId) {
-			const newCanvasData = data.canvasData || {};
-			
-			const CHUNK_SIZE = 1000; // Adjust the chunk size to balance performance and responsiveness
-			const pixelKeys = Object.keys(newCanvasData);
-			let currentChunk = [];
-	
-			// Function to process a chunk of pixels
-			const processChunk = async () => {
-				for (let i = 0; i < currentChunk.length; i++) {
-					const key = currentChunk[i];
-					const [px, py] = key.split(',').map(Number);
-					const newColor = newCanvasData[key].color;
-	
-					// Only redraw pixels if the color has changed
-					if (canvasObj.canvasData[key] && canvasObj.canvasData[key].color !== newColor) {
-						ctx.fillStyle = newColor;
-						ctx.fillRect(px, py, 1, 1);
-					} else if (!canvasObj.canvasData[key]) {
-						// If the pixel is new, draw it
-						ctx.fillStyle = newColor;
-						ctx.fillRect(px, py, 1, 1);
-					}
-				}
-			};
-	
-			// Asynchronously fill the canvas with data in chunks
-			const fillCanvasAsync = async () => {
-				for (let i = 0; i < pixelKeys.length; i++) {
-					currentChunk.push(pixelKeys[i]);
-	
-					// Once we've gathered enough pixels, process the chunk
-					if (currentChunk.length >= CHUNK_SIZE || i === pixelKeys.length - 1) {
-						await processChunk();  // Process the chunk
-						currentChunk = [];     // Reset chunk
-	
-						// Yield back to the browser to avoid blocking
-						await new Promise(resolve => {
-							requestIdleCallback ? requestIdleCallback(resolve) : setTimeout(resolve, 0);
-						});
-					}
-				}
-	
-				// Update the canvas object data
-				canvasObj.canvasData = { ...canvasObj.canvasData, ...newCanvasData };
-				loadingIndicator.style.display = 'none';
-				updateArrowsVisibility(x, y);
-			};
-	
-			// Start asynchronous filling of the canvas with chunked drawing
-			fillCanvasAsync();
-		}
-	});
+        // Helper function to find the largest rectangle of contiguous color starting from (x, y)
+        const findRectangle = (startX, startY, color) => {
+            let endX = startX;
+            let endY = startY;
+
+            // Extend rectangle horizontally as long as the color matches
+            while (endX < canvasWidth && newCanvasData[startY * canvasWidth + endX]?.color === color && !processed.has(startY * canvasWidth + endX)) {
+                endX++;
+            }
+
+            // Extend rectangle vertically, but only as long as all pixels in the row match the same color
+            let validHeight = true;
+            while (endY < canvasHeight && validHeight) {
+                for (let x = startX; x < endX; x++) {
+                    if (newCanvasData[endY * canvasWidth + x]?.color !== color || processed.has(endY * canvasWidth + x)) {
+                        validHeight = false;
+                        break;
+                    }
+                }
+                if (validHeight) endY++;
+            }
+
+            // Mark all pixels in this rectangle as processed
+            for (let y = startY; y < endY; y++) {
+                for (let x = startX; x < endX; x++) {
+                    processed.add(y * canvasWidth + x);
+                }
+            }
+
+            return { endX, endY };
+        };
+
+        // Helper function to draw a rectangle of contiguous color
+        const drawRectangle = (startX, startY, endX, endY, color) => {
+            const width = endX - startX;
+            const height = endY - startY;
+            ctx.fillStyle = color;
+            ctx.fillRect(startX, startY, width, height);
+        };
+
+        // Process the entire canvas to find and draw rectangles of the same color
+        const fillCanvasAsync = async () => {
+            for (let py = 0; py < canvasHeight; py++) {
+                for (let px = 0; px < canvasWidth; px++) {
+                    const index = py * canvasWidth + px;
+                    const currentColor = newCanvasData[index]?.color || '#FFFFFF'; // Default to white
+
+                    // If this pixel has not been processed, find the largest rectangle
+                    if (!processed.has(index)) {
+                        const { endX, endY } = findRectangle(px, py, currentColor);
+                        drawRectangle(px, py, endX, endY, currentColor);
+                    }
+
+                    // Update pixel data if it's new or changed
+                    if (!canvasObj.canvasData[index] || canvasObj.canvasData[index].color !== currentColor) {
+                        canvasObj.canvasData[index] = {
+                            color: currentColor,
+                            user: newCanvasData[index]?.user || null,
+                            timestamp: newCanvasData[index]?.timestamp || Date.now()
+                        };
+                    }
+                }
+
+            }
+
+            // Update the canvas object data
+            canvasObj.canvasData = new Set(newCanvasData);
+            loadingIndicator.style.display = 'none';
+            updateArrowsVisibility(x, y);
+        };
+
+        // Start asynchronous filling of the canvas with grouped drawing
+        fillCanvasAsync();
+    }
+});
+
 }
 
 /**
@@ -1156,7 +1163,7 @@ window.onload = () => {
         canvasObj.ctx.imageSmoothingEnabled = false;
 
         
-        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId, extra_data.targetColor, user);
+        drawBrush(canvasObj.ctx, x, y, Math.floor(size), color, canvasId, user);
      
     });
 };

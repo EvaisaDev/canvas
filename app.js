@@ -115,10 +115,11 @@ const createOrGetCanvas = (canvasId) => {
         canvas = canvasEnmap.get(canvasId) || {
             id: canvasId,
             edited: false,
-            data: {},
+            data: Array(512 * 512).fill().map((_, i) => ({ color: '#ffffff', user: null, timestamp: 0 })),
             lastAccessed: getCurrentTimestamp(),
             viewers: 0
         };
+
         canvases.set(canvasId, canvas);
     }
 
@@ -230,7 +231,7 @@ io.on('connection', (socket) => {
                 if ((dx * dx) + (dy * dy) < radiusSquared) {
                     const pixelX = x + xOffset - Math.floor(radius) + 1;
                     const pixelY = y + yOffset - Math.floor(radius) + 1;
-                    const key = `${pixelX},${pixelY}`;
+                    const key = (pixelY * 512) + pixelX;
 
                     if (extra_data?.targetColor) {
                         const existingPixel = canvasData[key];
@@ -247,16 +248,6 @@ io.on('connection', (socket) => {
 
         const pixelInfo = { color, user, timestamp };
         io.to(`canvas-${canvasId}`).emit('draw', { ...data, user, timestamp });
-    });
-
-    // Handle canvas save (optional)
-    socket.on('save-canvas', ({ canvasId, canvasData }) => {
-        if (!canvasId || !canvases.has(canvasId)) return;
-
-        const canvas = canvases.get(canvasId);
-        canvas.data = canvasData;
-        canvas.edited = true;
-        canvas.lastAccessed = getCurrentTimestamp();
     });
 
     // Provide canvas list
